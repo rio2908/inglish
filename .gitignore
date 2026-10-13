@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.buildozer/
+build/
+bin/
+sniffer_save.json
+sniffer_save.tmp
+font-check.png
+smoke.png

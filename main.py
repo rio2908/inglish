@@ -65,7 +65,7 @@ STORIES = [
 
 
 def save_path():
-    if sys.platform == "android":
+    if sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ:
         try:
             from android.storage import app_storage_path
             return Path(app_storage_path()) / "sniffer_save.json"
@@ -138,12 +138,13 @@ def draw_poop(surf, x, y):
 class GameApp:
     def __init__(self):
         pygame.init()
+        pygame.font.init()
         try:
             pygame.mixer.init()
         except pygame.error:
             pass
-        if sys.platform == "android":
-            self.display = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        if sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ:
+            self.display = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN | pygame.SCALED)
         else:
             self.display = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
         pygame.display.set_caption("Сниффер и сад слов")

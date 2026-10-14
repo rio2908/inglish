@@ -1,6 +1,7 @@
 """Offline word playback: Android system TTS, or optional pre-recorded WAVs."""
 
 from pathlib import Path
+import os
 import sys
 
 import pygame
@@ -15,7 +16,7 @@ class Speech:
         self.tts = None
         self.locale = None
         self.listener = None
-        if sys.platform == "android":
+        if sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ:
             self._init_android()
 
     def _init_android(self):

@@ -27,7 +27,7 @@ python main.py
 
 В GitHub Actions есть отдельный workflow **Build Android Debug APK**, как в MathCraft. После отправки изменений в `main` откройте **Actions → Build Android Debug APK → Run workflow**. После успешной сборки скачайте APK из артефакта **SnifferGarden-Android-debug** на странице запуска. Сборка запускается только вручную.
 
-`buildozer.spec` основан на работающей конфигурации MathCraft: `pygame-ce`, горизонтальная ориентация, arm64-v8a, Android API 34, min API 24 и NDK 26b. Сборка APK запускается из Linux/WSL с установленным Buildozer:
+`buildozer.spec` использует тот же Android-стек, что и работающий MathCraft: Python 3.10.11, `pygame`, python-for-android v2024.01.21, SDL2, горизонтальная ориентация, arm64-v8a, Android API 34, min API 24 и NDK 25b. Сборка APK запускается из Linux/WSL с установленным Buildozer:
 
 ```bash
 buildozer -v android debug

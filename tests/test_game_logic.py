@@ -14,6 +14,14 @@ class GameLogicTests(unittest.TestCase):
         self.assertEqual(len({word["id"] for word in WORDS}), 150)
         self.assertEqual([sum(word["chapter"] == chapter for word in WORDS) for chapter in range(10)], [15] * 10)
 
+    def test_greetings_replace_standalone_articles(self):
+        words = {word["en"]: word for word in WORDS}
+        for article in ("a", "an", "the"):
+            self.assertNotIn(article, words)
+        for english, russian in (("hello", "привет"), ("bye", "пока")):
+            self.assertEqual(words[english]["ru"], russian)
+            self.assertEqual(words[english]["chapter"], 0)
+
     def test_egg_hatches_after_five_correct_answers_but_learning_needs_recall(self):
         game = new_game()
         first = start_session(game)

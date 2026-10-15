@@ -1,11 +1,9 @@
-"""Sniffer Garden: a small landscape Android game built on MathCraft's pygame stack."""
+"""Inglish: a small landscape Android game built on MathCraft's pygame stack."""
 
 import asyncio
-import json
 import math
 import os
 from pathlib import Path
-import random
 import sys
 
 import pygame
@@ -13,11 +11,18 @@ import pygame
 from game_logic import (
     can_explore, choice_ids, clean, egg_frame, explore, feed, finish_session,
     growth_stage, hatch_complete, mark_seen, mastered, mastered_count,
-    new_game, normalize_game, play, record_answer, start_session,
+    clean_pet_name, growth_remaining, play, record_answer, start_session,
 )
+from game_backup import ProfilePicker
+from game_storage import load_game, write_game
+from learning_stats import (
+    advance_review, answer_review, pending_review, review_choices, review_score,
+    start_review, statistics, word_status,
+)
+from pet_games import GAME_NAMES, MOVES, TOOLS, PetGame
 from sprites import SnifferSprites
 from speech import Speech
-from words import WORD_BY_ID
+from words import CHAPTERS, WORDS, WORD_BY_ID
 
 
 WIDTH, HEIGHT = 1000, 600
@@ -62,41 +67,6 @@ STORIES = [
     ("The garden is clean.", "It is a good garden.", "Сад чистый.", "Это хороший сад."),
     ("Where is the ball?", "It is under the tree.", "Где мяч?", "Он под деревом."),
 ]
-
-
-def save_path():
-    if sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ:
-        try:
-            from android.storage import app_storage_path
-            return Path(app_storage_path()) / "sniffer_save.json"
-        except Exception:
-            pass
-    return ROOT / "sniffer_save.json"
-
-
-def load_game():
-    try:
-        with save_path().open("r", encoding="utf-8") as file:
-            return normalize_game(json.load(file))
-    except (OSError, ValueError, TypeError):
-        return new_game()
-
-
-def save_game(game):
-    path = save_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        with temporary.open("w", encoding="utf-8") as file:
-            json.dump(game, file, ensure_ascii=False)
-        try:
-            os.replace(temporary, path)
-        except OSError:
-            # Some browser-backed filesystems do not support atomic replace.
-            with path.open("w", encoding="utf-8") as file:
-                json.dump(game, file, ensure_ascii=False)
-    except OSError:
-        pass
 
 
 def text(surf, value, size, center, color=INK, bold=False):
@@ -147,12 +117,12 @@ class GameApp:
             self.display = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN | pygame.SCALED)
         else:
             self.display = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-        pygame.display.set_caption("Сниффер и сад слов")
+        pygame.display.set_caption("Inglish")
+        pygame.display.set_icon(pygame.image.load(str(ROOT / "assets" / "icon.png")))
         self.canvas = pygame.Surface((WIDTH, HEIGHT))
         self.viewport = pygame.Rect(0, 0, WIDTH, HEIGHT)
         self.pet_rect = pygame.Rect(0, 0, 0, 0)
         self.poop_rect = None
-        self.ball_rect = pygame.Rect(0, 0, 0, 0)
         self.clock = pygame.time.Clock()
         self.sprites = SnifferSprites()
         self.game = load_game()
@@ -174,14 +144,104 @@ class GameApp:
         self.just_mastered = False
         self.just_hatched = False
         self.session_answer_count = 0
-        self.play_hits = 0
-        self.ball_x = 690
+        self.pet_game = None
         self.story_index = 0
         self.pet_tapped_until = 0
         self.hatching_until = 0
         self.running = True
         self.last_pointer_ms = -1000
         self.last_pointer_pos = (-1000, -1000)
+        self.profile_picker = ProfilePicker()
+        self.imported_game = None
+        self.name_input = self.game["pet_name"]
+        self.profile_notice = ""
+        self.review_options = []
+        self.stats_tab = "overview"
+        self.stats_page = 0
+        self.restore_lesson()
+
+    def restore_lesson(self):
+        lesson = self.game.get("lesson")
+        if lesson:
+            self.queue = lesson["queue"][:]
+            self.card_index = lesson["index"]
+            self.word_id = self.queue[self.card_index]
+            self.card_phase = lesson["phase"]
+            self.quiz_mode = lesson["mode"]
+            self.answer_correct = lesson["correct"]
+            self.session_answer_count = lesson["answers"]
+            self.options = choice_ids(self.word_id)
+            self.screen = "cards"
+        if self.game["active_review"] is not None:
+            self.review_options = review_choices(self.game)
+            self.screen = "review"
+
+    def persist(self):
+        if self.screen == "cards" and self.word_id:
+            self.game["lesson"] = {
+                "queue": self.queue[:], "index": self.card_index,
+                "phase": self.card_phase, "mode": self.quiz_mode,
+                "correct": self.answer_correct, "answers": self.session_answer_count,
+            }
+        try:
+            write_game(self.game)
+            return True
+        except Exception as error:
+            self.notify("Не удалось сохранить игру. Выгрузите профиль.", 8)
+            self.profile_notice = f"Ошибка сохранения: {error}"
+            return False
+
+    def open_profile(self):
+        self.name_input = self.game["pet_name"]
+        self.screen = "profile"
+
+    def edit_name(self):
+        self.name_input = self.game["pet_name"]
+        self.screen = "name"
+        pygame.key.start_text_input()
+        pygame.key.set_text_input_rect(pygame.Rect(220, 240, 560, 60))
+
+    def accept_name(self):
+        name = clean_pet_name(self.name_input)
+        if not name:
+            return
+        self.game["pet_name"] = name
+        pygame.key.stop_text_input()
+        self.screen = "profile"
+        if self.persist():
+            self.profile_notice = "Имя сохранено."
+
+    def transfer_profile(self, export):
+        self.persist()
+        try:
+            self.profile_picker.start(export, self.game)
+        except Exception as error:
+            self.profile_notice = f"Не удалось открыть файл: {error}"
+
+    def poll_profile(self):
+        result = self.profile_picker.poll()
+        if result:
+            self.profile_notice, imported = result
+            if imported is not None:
+                self.imported_game = imported
+                self.screen = "import"
+
+    def accept_import(self):
+        # Persist the imported profile before replacing the current in-memory game.
+        try:
+            write_game(self.imported_game)
+        except Exception as error:
+            self.profile_notice = f"Профиль не загружен: {error}"
+            self.screen = "profile"
+            return
+        self.game = self.imported_game
+        self.imported_game = None
+        self.queue = []
+        self.word_id = None
+        self.just_mastered = self.just_hatched = False
+        self.screen = "home"
+        self.restore_lesson()
+        self.notify("Профиль загружен!")
 
     def notify(self, value, duration=3.2):
         self.message = value
@@ -198,26 +258,31 @@ class GameApp:
 
     def play_audio(self, word_id):
         if not self.speech.speak(word_id):
-            self.audio_notice = "На ПК нет записи слова; на Android работает системная озвучка"
+            self.audio_notice = self.speech.error or "Не удалось воспроизвести английскую озвучку"
             self.audio_notice_until = pygame.time.get_ticks() / 1000 + 4
 
     def start_lesson(self):
+        if self.game["active_review"] is not None or pending_review(self.game) is not None:
+            self.open_review()
+            return
         self.queue = start_session(self.game)
         self.card_index = 0
         self.session_answer_count = 0
         if not self.queue:
             self.notify("Все слова выучены! Можно повторять главы.")
             return
-        save_game(self.game)
         self.screen = "cards"
         self.prepare_card()
 
     def prepare_card(self):
         if self.card_index >= len(self.queue):
             finish_session(self.game)
-            save_game(self.game)
+            self.game["lesson"] = None
             self.screen = "home"
+            self.persist()
             self.notify("Раунд закончен! Загляни к снифферу.")
+            if pending_review(self.game) is not None:
+                self.open_review()
             return
         self.word_id = self.queue[self.card_index]
         record = self.game["cards"].get(self.word_id, {})
@@ -225,16 +290,21 @@ class GameApp:
         self.card_phase = "intro" if self.card_new else "quiz"
         self.quiz_mode = "meaning" if self.card_new or not record.get("correct_sessions") else "spelling"
         self.options = choice_ids(self.word_id)
-        if not self.card_new:
+        self.persist()
+        if pending_review(self.game) is not None:
+            self.open_review()
+        elif not self.card_new:
             self.play_audio(self.word_id)
 
     def intro_done(self):
         mark_seen(self.game, self.word_id)
-        save_game(self.game)
         self.card_phase = "quiz"
+        self.persist()
         self.play_audio(self.word_id)
 
     def answer(self, chosen_id):
+        if self.card_phase != "quiz":
+            return
         self.answer_correct = chosen_id == self.word_id
         self.session_answer_count += 1
         before_hatch = hatch_complete(self.game)
@@ -243,35 +313,76 @@ class GameApp:
         if self.just_hatched:
             self.hatching_until = pygame.time.get_ticks() / 1000 + 4
         self.card_phase = "result"
-        save_game(self.game)
+        self.persist()
 
     def next_card(self):
         self.card_index += 1
         self.prepare_card()
 
+    def open_review(self):
+        if start_review(self.game) is None:
+            return
+        self.review_options = review_choices(self.game)
+        self.screen = "review"
+        self.persist()
+
+    def submit_review(self, chosen_id):
+        if answer_review(self.game, chosen_id):
+            self.persist()
+
+    def next_review(self):
+        advance_review(self.game)
+        self.review_options = review_choices(self.game)
+        self.persist()
+
+    def close_review(self):
+        review = self.game["active_review"]
+        if review is not None and review["phase"] == "summary":
+            self.game["active_review"] = None
+        self.screen = "home"
+        self.restore_lesson()
+        self.persist()
+
+    def pause_review(self):
+        self.screen = "home"
+        self.persist()
+        self.notify("Проверку можно продолжить кнопкой «Учить слова».")
+
+    def open_statistics(self):
+        self.stats_tab = "overview"
+        self.stats_page = 0
+        self.screen = "statistics"
+
+    def statistics_tab(self, tab):
+        self.stats_tab = tab
+        self.stats_page = 0
+
     def do_feed(self, food):
         if feed(self.game, food):
-            save_game(self.game)
             self.screen = "home"
+            self.persist()
             self.notify("Сниффер поел и довольно сопит!")
 
     def do_clean(self):
         if clean(self.game):
-            save_game(self.game)
+            self.persist()
             self.notify("Чисто! Отходы стали компостом для сада.")
         else:
             self.notify("Пока убирать нечего.")
 
     def do_explore(self):
         if explore(self.game):
-            save_game(self.game)
             self.story_index = min(len(STORIES) - 1, self.game["garden_plants"] - 1)
             self.screen = "story"
+            self.persist()
 
     def finish_play(self):
+        if self.pet_game is None or not self.pet_game.done:
+            return
         if play(self.game):
-            save_game(self.game)
+            self.pet_game = None
             self.screen = "home"
+            self.persist()
             self.notify("Вы отлично поиграли вместе!")
 
     def draw_background(self):
@@ -288,30 +399,36 @@ class GameApp:
 
     def draw_header(self):
         pygame.draw.rect(self.canvas, INK, (0, 0, WIDTH, 65))
-        text(self.canvas, "СНИФФЕР И САД СЛОВ", 38, (240, 33), CREAM, True)
-        text(self.canvas, "150 английских слов", 27, (860, 33), GOLD)
+        text(self.canvas, "Inglish", 44, (170, 33), CREAM, True)
+        if self.screen == "home":
+            self.button((535, 10, 220, 43), "СТАТИСТИКА", self.open_statistics, fill=(88, 129, 155), size=25)
+            self.button((770, 10, 195, 43), "ПРОФИЛЬ", self.open_profile, fill=TEAL, size=27)
+        else:
+            text(self.canvas, "150 английских слов", 27, (860, 33), GOLD)
 
     def draw_progress(self):
-        rect = pygame.Rect(35, 82, 365, 150)
+        rect = pygame.Rect(35, 82, 618, 88)
         panel(self.canvas, rect)
         learned = mastered_count(self.game)
-        text(self.canvas, f"Выучено: {learned} / 150", 33, (217, 111), INK, True)
-        for i in range(30):
-            col, row = i % 15, i // 15
-            tile(self.canvas, 55 + col * 22, 144 + row * 29, TEAL_LIGHT if i < learned // 5 else PAPER_DARK, 17)
-        text(self.canvas, "1 клетка = 5 слов", 22, (217, 215), (77, 94, 79))
+        text(self.canvas, f"Выучено: {learned} / 150", 30, (344, 108), INK, True)
+        kind, remaining = growth_remaining(self.game)
+        if kind == "answers":
+            caption = f"До вылупления — правильных ответов: {remaining}"
+        elif kind == "words":
+            caption = f"До следующего превращения — слов: {remaining}"
+        else:
+            caption = "Сниффер вырос! Продолжайте собирать сад."
+        text(self.canvas, caption, 26, (344, 145), TEAL, True)
 
     def draw_garden(self):
-        rect = pygame.Rect(35, 247, 618, 237)
-        panel(self.canvas, rect, (197, 231, 198))
-        pygame.draw.rect(self.canvas, (150, 202, 150), (39, 251, 610, 150))
-        pygame.draw.rect(self.canvas, (78, 153, 75), (39, 401, 610, 18))
-        pygame.draw.rect(self.canvas, GROUND, (39, 419, 610, 61))
-        for x in range(58, 630, 36):
-            tile(self.canvas, x, 425 + (x // 36 % 2) * 20, (141, 95, 60), 18, (104, 70, 46))
+        # The pet lives on the main meadow, not in a separate framed scene.
+        for x in range(55, 640, 47):
+            y = 453 + (x % 3) * 9
+            pygame.draw.line(self.canvas, (65, 126, 58), (x, y), (x - 5, y - 9), 3)
+            pygame.draw.line(self.canvas, (65, 126, 58), (x, y), (x + 5, y - 12), 3)
         for i in range(self.game["garden_plants"]):
             x = 75 + (i % 10) * 52
-            y = 393 - (i // 10) * 29
+            y = 473 - (i // 10) * 29
             draw_flower(self.canvas, x, y, 9, GOLD if i % 2 else (235, 98, 144))
 
         now = pygame.time.get_ticks() / 1000
@@ -329,14 +446,15 @@ class GameApp:
             x = 343 + int(math.sin(now * 0.72) * 55)
         else:
             pet = self.sprites.scaled("growth", stage, 285 if stage >= 3 else 290, 225 if stage >= 3 else 165)
-            x = 510 if stage >= 3 else 343
+            x = 365 if stage >= 3 else 343
         bob = 0 if stage == 0 else int(math.sin(now * 4) * 3)
-        self.canvas.blit(pet, pet.get_rect(midbottom=(x, 419 + bob)))
-        self.pet_rect = pet.get_rect(midbottom=(x, 419 + bob))
+        pygame.draw.ellipse(self.canvas, (76, 133, 63), (x - pet.get_width() // 2, 439, pet.get_width(), 24))
+        self.canvas.blit(pet, pet.get_rect(midbottom=(x, 455 + bob)))
+        self.pet_rect = pet.get_rect(midbottom=(x, 455 + bob))
         if self.game["poop"]:
             poop_x = 95 if stage >= 3 else 540
-            draw_poop(self.canvas, poop_x, 420)
-            self.poop_rect = pygame.Rect(poop_x - 8, 412, 95, 59)
+            draw_poop(self.canvas, poop_x, 440)
+            self.poop_rect = pygame.Rect(poop_x - 8, 432, 95, 59)
         else:
             self.poop_rect = None
         if now < self.pet_tapped_until:
@@ -354,7 +472,8 @@ class GameApp:
         self.draw_progress()
         stage = growth_stage(self.game)
         panel(self.canvas, pygame.Rect(676, 82, 289, 402))
-        text(self.canvas, STAGE_NAMES[stage], 32, (820, 111), INK, True)
+        text(self.canvas, self.game["pet_name"], 29, (820, 105), INK, True)
+        text(self.canvas, STAGE_NAMES[stage], 23, (820, 132), TEAL)
         if stage == 0:
             text(self.canvas, f"Трещин: {egg_frame(self.game)} / 4", 27, (820, 156), TEAL, True)
             text(self.canvas, "5 ответов — малыш появится", 23, (820, 190), INK)
@@ -366,9 +485,11 @@ class GameApp:
             self.draw_care_meter("Игра", "joy", 203)
             self.draw_care_meter("Чистота", "clean", 248)
             self.button((701, 288, 238, 45), "Покормить", lambda: setattr(self, "screen", "feed"), fill=(174, 112, 61), size=26)
-            self.button((701, 345, 238, 45), "Поиграть", self.start_play, fill=(84, 129, 168), size=26)
+            self.button((701, 345, 238, 45), GAME_NAMES[stage], self.start_play, fill=(84, 129, 168), size=23)
             self.button((701, 402, 238, 45), "Убрать", self.do_clean, enabled=self.game["poop"], fill=(100, 117, 79), size=26)
-        self.button((35, 506, 365, 63), "УЧИТЬ СЛОВА", self.start_lesson, fill=TEAL, size=36)
+        milestone = pending_review(self.game)
+        label = "ПРОДОЛЖИТЬ ТЕСТ" if self.game["active_review"] else f"ПРОВЕРКА: {milestone} СЛОВ" if milestone else "УЧИТЬ СЛОВА"
+        self.button((35, 506, 365, 63), label, self.start_lesson, fill=TEAL, size=29 if milestone or self.game["active_review"] else 36)
         available = self.game["garden_plants"] < mastered_count(self.game) // 15
         self.button((420, 506, 232, 63), "ИСКАТЬ СЕМЕНА", self.do_explore, enabled=can_explore(self.game), fill=(119, 138, 65), size=27)
         if available and not can_explore(self.game):
@@ -420,8 +541,8 @@ class GameApp:
             self.draw_word_art(word)
             text(self.canvas, "Новое слово", 28, (686, 163), TEAL, True)
             self.draw_letter_tiles(word["en"], 686, 198, 34 if len(word["en"]) < 10 else 28)
-            text(self.canvas, word["hint"], 40, (686, 292), RED)
-            text(self.canvas, word["ru"], 36, (686, 339), INK, True)
+            text(self.canvas, word["hint"], 46, (686, 292), RED)
+            text(self.canvas, word["ru"], 42, (686, 339), TEAL, True)
             self.button((586, 382, 246, 54), "СЛУШАТЬ", lambda: self.play_audio(self.word_id), fill=(88, 129, 155), size=26)
             self.button((586, 472, 246, 63), "ПОНЯТНО", self.intro_done, size=32)
         elif self.card_phase == "quiz":
@@ -430,7 +551,7 @@ class GameApp:
                 self.draw_letter_tiles(word["en"], 500, 210, 36 if len(word["en"]) < 10 else 29)
             else:
                 text(self.canvas, "Выбери английское слово", 35, (500, 171), INK, True)
-                text(self.canvas, word["ru"], 45, (500, 233), TEAL, True)
+            text(self.canvas, word["ru"], 49, (500, 233), TEAL, True)
             self.button((782, 145, 115, 49), "ЗВУК", lambda: self.play_audio(self.word_id), fill=(88, 129, 155), size=23)
             for i, option_id in enumerate(self.options):
                 option = WORD_BY_ID[option_id]
@@ -440,7 +561,8 @@ class GameApp:
             badge = "ПРАВИЛЬНО!" if self.answer_correct else "ПОПРОБУЕМ ЕЩЁ ПОЗЖЕ"
             text(self.canvas, badge, 42, (500, 172), TEAL if self.answer_correct else RED, True)
             self.draw_letter_tiles(word["en"], 500, 223, 37 if len(word["en"]) < 10 else 29)
-            text(self.canvas, f"{word['hint']}  —  {word['ru']}", 34, (500, 293), INK)
+            text(self.canvas, word["hint"], 40, (300, 293), RED)
+            text(self.canvas, word["ru"], 40, (690, 293), TEAL, True)
             if not hatch_complete(self.game) or self.just_hatched:
                 egg = self.sprites.scaled("hatching", egg_frame(self.game), 130, 135)
                 self.canvas.blit(egg, egg.get_rect(center=(500, 380)))
@@ -460,8 +582,9 @@ class GameApp:
     def leave_cards(self):
         if self.session_answer_count:
             finish_session(self.game)
-        save_game(self.game)
         self.screen = "home"
+        self.game["lesson"] = None
+        self.persist()
         self.notify("Можно продолжить слова в любой момент.")
 
     def draw_feed(self):
@@ -488,23 +611,148 @@ class GameApp:
         self.button((390, 448, 220, 52), "НАЗАД", lambda: setattr(self, "screen", "home"), fill=(124, 111, 89))
 
     def start_play(self):
+        stage = growth_stage(self.game)
+        if not stage:
+            self.notify("Поиграем, когда малыш вылупится!")
+            return
+        self.pet_game = PetGame(stage, pygame.time.get_ticks())
         self.screen = "play"
-        self.play_hits = 0
-        self.ball_x = 690
+
+    def play_choice(self, index):
+        if self.pet_game is not None:
+            self.pet_game.choose(index, pygame.time.get_ticks())
+
+    def leave_play(self):
+        self.pet_game = None
+        self.screen = "home"
+
+    def draw_play_pet(self, center, size=(220, 150), move=None):
+        pet = self.sprites.scaled("growth", self.pet_game.stage, *size)
+        now = pygame.time.get_ticks()
+        x, y = center
+        if move == 0:
+            y -= int(abs(math.sin(now / 160)) * 45)
+        elif move == 1:
+            x += int(math.sin(now / 55) * 9)
+        elif move == 2:
+            pet = pygame.transform.flip(pet, now // 220 % 2 == 0, False)
+        self.canvas.blit(pet, pet.get_rect(midbottom=(x, y)))
+
+    def draw_bush(self, rect, color=(66, 132, 65)):
+        pygame.draw.rect(self.canvas, (92, 67, 44), (rect.centerx - 13, rect.bottom - 43, 26, 36))
+        for dx, dy, w, h in ((0, 35, rect.width, 65), (25, 10, rect.width - 50, 100), (50, 0, rect.width - 100, 100)):
+            pygame.draw.rect(self.canvas, color, (rect.x + dx, rect.y + dy, w, h))
+        for dx, dy in ((35, 42), (92, 25), (130, 65)):
+            tile(self.canvas, rect.x + dx, rect.y + dy, (108, 169, 81), 14, color)
+
+    def draw_treat_game(self):
+        activity = self.pet_game
+        self.draw_play_pet((500, 290), (175, 95), 1 if activity.phase == "celebrate" else None)
+        for i in range(3):
+            rect = pygame.Rect(110 + i * 300, 310, 180, 140)
+            self.draw_bush(rect)
+            text(self.canvas, str(i + 1), 29, (rect.centerx, 453), INK, True)
+            if activity.phase == "search":
+                self.buttons.append((rect, lambda index=i: self.play_choice(index)))
+            if activity.phase == "celebrate" and i == activity.target:
+                tile(self.canvas, rect.centerx - 20, 295, RED, 40)
+                tile(self.canvas, rect.centerx - 4, 282, TEAL, 15)
+                text(self.canvas, "Нашли!", 26, (rect.centerx, 266), TEAL, True)
+            elif activity.last_choice is not None and i == activity.target:
+                text(self.canvas, "нюх-нюх…", 24, (rect.centerx, 289), TEAL, True)
+
+    def draw_hide_game(self):
+        activity = self.pet_game
+        for i in range(4):
+            rect = pygame.Rect(55 + i * 240, 286, 170, 170)
+            # A different piece of the pet peeks out from each hiding place.
+            if i == activity.target and activity.phase == "search":
+                pet = self.sprites.scaled("growth", 2, 160, 100)
+                self.canvas.blit(pet, pet.get_rect(midbottom=(rect.centerx + 52, rect.bottom - 12)))
+            if i in (0, 3):
+                self.draw_bush(pygame.Rect(rect.x, rect.y + 45, 155, 125))
+            elif i == 1:
+                pygame.draw.rect(self.canvas, GROUND, (rect.centerx - 25, rect.y + 30, 65, 140))
+                self.draw_bush(pygame.Rect(rect.x - 5, rect.y - 25, 180, 110), (49, 114, 63))
+            else:
+                pygame.draw.rect(self.canvas, (122, 134, 130), (rect.x + 10, rect.y + 60, 145, 110))
+                pygame.draw.rect(self.canvas, (155, 166, 159), (rect.x + 35, rect.y + 36, 100, 95))
+            if activity.phase == "celebrate" and i == activity.target:
+                self.draw_play_pet((rect.centerx, rect.bottom), (180, 135), 0)
+                text(self.canvas, "Нашёл!", 26, (rect.centerx, 260), TEAL, True)
+            elif activity.last_choice == i and i != activity.target:
+                text(self.canvas, "Тут пусто", 24, (rect.centerx, 260), INK)
+            if activity.phase == "search":
+                self.buttons.append((rect.inflate(25, 10), lambda index=i: self.play_choice(index)))
+
+    def draw_memory_game(self):
+        activity = self.pet_game
+        move = activity.shown_move(pygame.time.get_ticks())
+        self.draw_play_pet((570, 365), (230, 130), move)
+        if move is not None:
+            text(self.canvas, MOVES[move] + "!", 32, (260, 238), TEAL, True)
+        elif activity.phase == "repeat":
+            text(self.canvas, f"Повторено: {activity.input_index} / {len(activity.sequence)}", 27, (260, 238), TEAL, True)
+        for i, label in enumerate(MOVES):
+            self.button((135 + i * 255, 390, 220, 65), label, lambda index=i: self.play_choice(index),
+                        enabled=activity.phase == "repeat", fill=TEAL_LIGHT if move == i else TEAL, size=29)
+        self.button((725, 526, 240, 48), "ПОКАЖИ ЕЩЁ", lambda: activity.replay(pygame.time.get_ticks()),
+                    enabled=activity.phase in ("show", "repeat"), fill=(88, 129, 155), size=24)
+
+    def draw_flower_game(self):
+        activity = self.pet_game
+        self.draw_play_pet((855, 350), (170, 140), 0 if activity.phase == "celebrate" else None)
+        for i, state in enumerate(activity.plants):
+            rect = pygame.Rect(100 + i * 235, 282, 185, 75)
+            pygame.draw.rect(self.canvas, GROUND, rect)
+            pygame.draw.rect(self.canvas, GOLD if i == activity.selected else INK, rect, 4)
+            if state == 1:
+                for dx in (-20, 0, 20):
+                    tile(self.canvas, rect.centerx + dx - 5, rect.centery - 5, GOLD, 10)
+            elif state == 2:
+                pygame.draw.rect(self.canvas, TEAL, (rect.centerx - 4, rect.y - 27, 8, 48))
+                pygame.draw.rect(self.canvas, TEAL_LIGHT, (rect.centerx - 22, rect.y - 21, 22, 12))
+            elif state == 3:
+                draw_flower(self.canvas, rect.centerx, rect.y - 30, 17, (RED, GOLD, (182, 109, 198))[i])
+            if activity.phase == "search":
+                self.buttons.append((rect.inflate(0, 60), lambda index=i: activity.select_bed(index)))
+        for i, label in enumerate(TOOLS):
+            self.button((100 + i * 235, 395, 185, 60), label, lambda index=i: self.play_choice(index),
+                        enabled=activity.phase == "search", fill=(88, 129, 155) if i == 1 else TEAL, size=26)
 
     def draw_play(self):
+        if self.pet_game is None:
+            self.start_play()
+            if self.pet_game is None:
+                self.screen = "home"
+                self.draw_home()
+                return
+        self.pet_game.tick(pygame.time.get_ticks())
+        if self.pet_game.done:
+            self.finish_play()
+            self.draw_home()
+            return
         self.draw_background()
+        pygame.draw.rect(self.canvas, GRASS, (0, 280, WIDTH, HEIGHT - 280))
+        for y in range(280, HEIGHT, 34):
+            for x in range(0, WIDTH, 34):
+                color = (105, 157, 74) if (x // 34 + y // 34) % 2 else (116, 166, 81)
+                pygame.draw.rect(self.canvas, color, (x, y, 34, 34))
         self.draw_header()
-        panel(self.canvas, pygame.Rect(80, 90, 840, 450), (211, 235, 204))
-        text(self.canvas, "Покидай снифферу мяч!", 40, (500, 138), INK, True)
-        text(self.canvas, f"Поймано: {self.play_hits} / 3", 30, (500, 177), TEAL)
-        pet = self.sprites.scaled("growth", growth_stage(self.game), 330, 215)
-        self.canvas.blit(pet, pet.get_rect(midbottom=(475, 425)))
-        t = pygame.time.get_ticks() / 1000
-        y = 269 + int(math.sin(t * 5) * 18)
-        tile(self.canvas, self.ball_x - 26, y - 26, GOLD, 52)
-        self.ball_rect = pygame.Rect(self.ball_x - 38, y - 38, 76, 76)
-        self.button((390, 462, 220, 53), "НАЗАД", lambda: setattr(self, "screen", "home"), fill=(124, 111, 89))
+        panel(self.canvas, pygame.Rect(35, 82, 930, 100))
+        text(self.canvas, GAME_NAMES[self.pet_game.stage], 39, (500, 111), TEAL, True)
+        unit = "Цветов" if self.pet_game.stage == 4 else "Найдено" if self.pet_game.stage in (1, 2) else "Повторено"
+        text(self.canvas, f"{unit}: {self.pet_game.hits} / 3", 25, (500, 153), INK, True)
+        if self.pet_game.stage == 1:
+            self.draw_treat_game()
+        elif self.pet_game.stage == 2:
+            self.draw_hide_game()
+        elif self.pet_game.stage == 3:
+            self.draw_memory_game()
+        else:
+            self.draw_flower_game()
+        text(self.canvas, self.pet_game.message, 24, (500, 493), INK, True)
+        self.button((35, 526, 180, 48), "В САД", self.leave_play, fill=(124, 111, 89), size=27)
 
     def draw_help(self):
         self.draw_background()
@@ -514,7 +762,7 @@ class GameApp:
             "КАК ИГРАТЬ",
             "1. Читай карточки и слушай английские слова.",
             "2. Узнай слово снова в следующем раунде — оно выучено.",
-            "3. Каждые 5 выученных слов заполняют клетку шкалы.",
+            "3. Превращения питомца: 40, 80 и 120 выученных слов.",
             "4. Корми питомца, играй с ним и убирай за ним.",
             "5. За каждые 15 слов сниффер ищет семечко для сада.",
             "Слова не пропадают, даже если долго не заходить в игру.",
@@ -540,6 +788,150 @@ class GameApp:
         if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
             text(self.canvas, self.audio_notice, 20, (500, 573), INK)
 
+    def draw_profile(self):
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(80, 82, 840, 476))
+        text(self.canvas, "ПРОФИЛЬ ПИТОМЦА", 37, (500, 120), TEAL, True)
+        text(self.canvas, self.game["pet_name"], 38, (500, 174), INK, True)
+        self.button((310, 210, 380, 48), "ИЗМЕНИТЬ ИМЯ", self.edit_name, size=27)
+        self.button((140, 287, 340, 55), "ВЫГРУЗИТЬ ПРОФИЛЬ", lambda: self.transfer_profile(True), size=25)
+        self.button((520, 287, 340, 55), "ЗАГРУЗИТЬ ПРОФИЛЬ", lambda: self.transfer_profile(False), size=25)
+        text(self.canvas, "Игра сохраняется автоматически после каждого действия.", 25, (500, 375), INK)
+        text(self.canvas, "Перед удалением игры выгрузите профиль в отдельный файл.", 24, (500, 411), INK)
+        text(self.canvas, "После переустановки загрузите этот файл здесь.", 24, (500, 442), INK)
+        self.button((390, 487, 220, 49), "В САД", lambda: setattr(self, "screen", "home"), size=27)
+        # Keep long platform errors inside the screen.
+        text(self.canvas, self.profile_notice[:95], 21, (500, 580), INK)
+
+    def draw_review(self):
+        review = self.game["active_review"]
+        if review is None:
+            self.screen = "home"
+            self.draw_home()
+            return
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(55, 78, 890, 492))
+        text(self.canvas, f"ПРОВЕРКА: {review['milestone']} СЛОВ", 34, (500, 112), TEAL, True)
+        if review["phase"] == "summary":
+            text(self.canvas, f"Верно: {review_score(review)} / {len(review['queue'])}", 45, (500, 194), TEAL, True)
+            mistakes = [word_id for word_id, chosen in zip(review["queue"], review["answers"]) if word_id != chosen]
+            text(self.canvas, "Эти слова повторим в следующих проверках:" if mistakes else "Отлично! Ты помнишь все слова!", 27, (500, 254), INK, True)
+            for i, word_id in enumerate(mistakes):
+                word = WORD_BY_ID[word_id]
+                text(self.canvas, f"{word['en']} — {word['ru']}", 27,
+                     (290 + (i % 2) * 420, 308 + (i // 2) * 43), TEAL)
+            text(self.canvas, "Результат сохранён. Выученные слова и рост не пропадают.", 24, (500, 457), INK)
+            self.button((340, 493, 320, 57), "ПРОДОЛЖИТЬ", self.close_review, size=31)
+            return
+        index = len(review["answers"]) - (1 if review["phase"] == "feedback" else 0)
+        word = WORD_BY_ID[review["queue"][index]]
+        text(self.canvas, f"Вопрос {index + 1} / {len(review['queue'])}", 25, (500, 153), INK)
+        if review["phase"] == "quiz":
+            text(self.canvas, "Выбери перевод" if index % 2 == 0 else "Выбери английское слово", 33, (500, 205), INK, True)
+            text(self.canvas, word["en"] if index % 2 == 0 else word["ru"], 46, (500, 259), TEAL, True)
+            self.button((785, 175, 110, 45), "ЗВУК", lambda: self.play_audio(word["en"]), fill=(88, 129, 155), size=22)
+            for i, word_id in enumerate(self.review_options):
+                option = WORD_BY_ID[word_id]
+                self.button((194, 307 + i * 65, 612, 54), option["ru"] if index % 2 == 0 else option["en"],
+                            lambda chosen=word_id: self.submit_review(chosen), size=32)
+        else:
+            correct = review["answers"][index] == word["id"]
+            text(self.canvas, "ПРАВИЛЬНО!" if correct else "ДАВАЙ ЗАПОМНИМ", 39, (500, 221), TEAL if correct else RED, True)
+            text(self.canvas, word["en"], 48, (500, 288), INK, True)
+            text(self.canvas, word["hint"], 42, (500, 341), RED)
+            text(self.canvas, word["ru"], 42, (500, 393), TEAL, True)
+            self.button((345, 470, 310, 60), "ИТОГИ" if len(review["answers"]) == 6 else "ДАЛЬШЕ", self.next_review, size=31)
+        self.button((78, 517, 140, 36), "ПОЗЖЕ", self.pause_review, fill=(124, 111, 89), size=23)
+        if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
+            text(self.canvas, self.audio_notice, 21, (500, 585), INK)
+
+    def draw_statistics(self):
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(35, 82, 930, 488))
+        text(self.canvas, "СТАТИСТИКА СЛОВ", 34, (500, 111), TEAL, True)
+        for i, (tab, label) in enumerate((("overview", "ОБЗОР"), ("words", "СЛОВА"), ("reviews", "ПРОВЕРКИ"))):
+            self.button((65 + i * 295, 140, 280, 43), label, lambda value=tab: self.statistics_tab(value),
+                        fill=TEAL if self.stats_tab == tab else (100, 111, 125), size=25)
+        stats = statistics(self.game)
+        if self.stats_tab == "overview":
+            text(self.canvas, f"Выучено: {stats['learned']} / 150", 33, (290, 222), TEAL, True)
+            text(self.canvas, f"К повторению: {stats['needs_review']}", 31, (720, 222), INK, True)
+            accuracy = f"{stats['accuracy']}%" if stats["accuracy"] is not None else "пока нет ответов"
+            text(self.canvas, f"Точность: {accuracy}", 28, (500, 265), INK, True)
+            text(self.canvas, f"Открыто: {stats['seen']} · Учим: {stats['learning']} · Верно: {stats['correct']} / {stats['attempts']}", 24, (500, 301), INK)
+            for i, (name, _) in enumerate(CHAPTERS):
+                words = [word for word in WORDS if word["chapter"] == i]
+                learned = sum(mastered(self.game, word["id"]) for word in words)
+                x, y = 280 + (i // 5) * 450, 347 + (i % 5) * 32
+                text(self.canvas, f"{name}: {learned} / 15", 25, (x, y), TEAL if learned == 15 else INK)
+            text(self.canvas, "Подсчёт ответов ведётся с обновления; прежний прогресс слов сохранён.", 21, (500, 497), INK)
+        elif self.stats_tab == "words":
+            text(self.canvas, "Слово", 24, (175, 208), TEAL, True)
+            text(self.canvas, "Перевод", 24, (410, 208), TEAL, True)
+            text(self.canvas, "Статус", 24, (670, 208), TEAL, True)
+            text(self.canvas, "Верно / всего", 23, (855, 208), TEAL, True)
+            for i, word in enumerate(WORDS[self.stats_page * 8:(self.stats_page + 1) * 8]):
+                y = 244 + i * 32
+                counts = self.game["word_stats"].get(word["id"], {})
+                attempts = counts.get("lesson_attempts", 0) + counts.get("review_attempts", 0)
+                correct = counts.get("lesson_correct", 0) + counts.get("review_correct", 0)
+                status = word_status(self.game, word["id"])
+                text(self.canvas, word["en"], 26, (175, y), INK, True)
+                text(self.canvas, word["ru"], 24, (410, y), INK)
+                text(self.canvas, status, 23, (670, y), TEAL if status == "Выучено" else INK)
+                text(self.canvas, f"{correct} / {attempts}" if attempts else "—", 24, (855, y), INK)
+            last_page = (len(WORDS) - 1) // 8
+            self.button((600, 517, 70, 37), "<", lambda: setattr(self, "stats_page", self.stats_page - 1), enabled=self.stats_page > 0)
+            text(self.canvas, f"{self.stats_page + 1} / {last_page + 1}", 24, (750, 536), INK)
+            self.button((830, 517, 70, 37), ">", lambda: setattr(self, "stats_page", self.stats_page + 1), enabled=self.stats_page < last_page)
+        else:
+            text(self.canvas, "Короткая проверка после каждых 30 выученных слов", 27, (500, 221), INK, True)
+            for i, milestone in enumerate((30, 60, 90, 120, 150)):
+                result = next((item for item in self.game["reviews"] if item["milestone"] == milestone), None)
+                if result:
+                    label = f"Верно: {result['score']} / {result['total']}"
+                elif self.game["active_review"] and self.game["active_review"]["milestone"] == milestone:
+                    label = "В процессе"
+                else:
+                    label = "Можно пройти" if stats["learned"] >= milestone else "Ещё не открыта"
+                text(self.canvas, f"{milestone} слов", 29, (290, 275 + i * 47), INK, True)
+                text(self.canvas, label, 28, (690, 275 + i * 47), TEAL if result else INK)
+        self.button((65, 517, 180, 37), "В САД", lambda: setattr(self, "screen", "home"), size=24)
+
+    def cancel_name(self):
+        pygame.key.stop_text_input()
+        self.screen = "profile"
+
+    def draw_name(self):
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(110, 110, 780, 390))
+        text(self.canvas, "Как зовут твоего питомца?", 40, (500, 171), TEAL, True)
+        panel(self.canvas, pygame.Rect(220, 240, 560, 60), WHITE)
+        text(self.canvas, self.name_input + "|", 36, (500, 270), INK)
+        text(self.canvas, "До 20 символов", 24, (500, 330), INK)
+        self.button((220, 390, 260, 60), "СОХРАНИТЬ", self.accept_name,
+                    enabled=bool(clean_pet_name(self.name_input)), size=28)
+        self.button((520, 390, 260, 60), "ОТМЕНА", self.cancel_name, fill=(124, 111, 89), size=28)
+
+    def cancel_import(self):
+        self.imported_game = None
+        self.screen = "profile"
+
+    def draw_import(self):
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(110, 110, 780, 390))
+        text(self.canvas, "Загрузить этот профиль?", 40, (500, 169), TEAL, True)
+        text(self.canvas, self.imported_game["pet_name"], 38, (500, 240), INK, True)
+        text(self.canvas, f"Выучено слов: {mastered_count(self.imported_game)} / 150", 30, (500, 290), INK)
+        text(self.canvas, "Текущий профиль будет заменён. Сначала выгрузите его, если нужен.", 23, (500, 345), RED)
+        self.button((220, 390, 260, 60), "ЗАГРУЗИТЬ", self.accept_import, size=28)
+        self.button((520, 390, 260, 60), "ОТМЕНА", self.cancel_import, fill=(124, 111, 89), size=28)
+
     def draw(self):
         self.buttons = []
         if self.screen == "home":
@@ -552,6 +944,16 @@ class GameApp:
             self.draw_play()
         elif self.screen == "story":
             self.draw_story()
+        elif self.screen == "profile":
+            self.draw_profile()
+        elif self.screen == "name":
+            self.draw_name()
+        elif self.screen == "import":
+            self.draw_import()
+        elif self.screen == "review":
+            self.draw_review()
+        elif self.screen == "statistics":
+            self.draw_statistics()
         else:
             self.draw_help()
         display_size = self.display.get_size()
@@ -573,12 +975,6 @@ class GameApp:
         x = (screen_pos[0] - self.viewport.left) * WIDTH / self.viewport.width
         y = (screen_pos[1] - self.viewport.top) * HEIGHT / self.viewport.height
         point = (int(x), int(y))
-        if self.screen == "play" and self.ball_rect.collidepoint(point):
-            self.play_hits += 1
-            self.ball_x = random.choice((230, 290, 690, 760))
-            if self.play_hits >= 3:
-                self.finish_play()
-            return
         if self.screen == "home":
             if self.poop_rect and self.poop_rect.collidepoint(point):
                 self.do_clean()
@@ -594,10 +990,29 @@ class GameApp:
 
     def handle_event(self, event):
         if event.type == pygame.QUIT:
+            self.persist()
             self.running = False
+        elif event.type in tuple(getattr(pygame, name, -1) for name in
+                                 ("APP_WILLENTERBACKGROUND", "APP_DIDENTERBACKGROUND", "WINDOWFOCUSLOST")):
+            self.persist()
+        elif event.type == pygame.TEXTINPUT and self.screen == "name":
+            self.name_input = "".join(c for c in (self.name_input + event.text) if c.isprintable())[:20]
+        elif event.type == pygame.KEYDOWN and self.screen == "name":
+            if event.key == pygame.K_BACKSPACE:
+                self.name_input = self.name_input[:-1]
+            elif event.key == pygame.K_RETURN:
+                self.accept_name()
+            elif event.key == pygame.K_ESCAPE:
+                self.cancel_name()
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             if self.screen == "cards":
                 self.leave_cards()
+            elif self.screen == "review":
+                self.pause_review()
+            elif self.screen == "play":
+                self.leave_play()
+            elif self.screen == "import":
+                self.cancel_import()
             else:
                 self.screen = "home"
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -609,16 +1024,23 @@ class GameApp:
 
 async def main():
     app = GameApp()
-    while app.running:
-        for event in pygame.event.get():
-            app.handle_event(event)
-        app.speech.tick()
-        app.draw()
-        await asyncio.sleep(0)
-        app.clock.tick(30)
-    save_game(app.game)
-    app.speech.shutdown()
-    pygame.quit()
+    try:
+        while app.running:
+            for event in pygame.event.get():
+                app.handle_event(event)
+            app.speech.tick()
+            app.poll_profile()
+            if app.speech.error:
+                app.audio_notice = app.speech.error
+                app.audio_notice_until = pygame.time.get_ticks() / 1000 + 4
+                app.speech.error = ""
+            app.draw()
+            await asyncio.sleep(0)
+            app.clock.tick(30)
+    finally:
+        app.persist()
+        app.speech.shutdown()
+        pygame.quit()
 
 
 if __name__ == "__main__":

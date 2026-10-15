@@ -1,12 +1,15 @@
 [app]
-title = Sniffer Garden
+title = Inglish
 package.name = sniffergarden
 package.domain = org.game
 source.dir = .
 source.include_exts = py,png,jpg,json,txt,wav
 source.exclude_dirs = .git,.github,.venv,.web-test-venv,build,bin,.buildozer,previews,tests,assets/concepts,assets/sprites-prototype
-source.exclude_patterns = __pycache__/*,*.pyc
+source.exclude_patterns = __pycache__/*,*.pyc,sniffer_save.json,sniffer_save.tmp
 version = 0.1
+icon.filename = assets/icon.png
+icon.adaptive_foreground.filename = assets/icon-foreground.png
+icon.adaptive_background.filename = assets/icon-background.png
 requirements = python3==3.10.11,hostpython3==3.10.11,pygame,pyjnius
 orientation = landscape
 fullscreen = 1

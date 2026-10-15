@@ -2,6 +2,7 @@
 
 import random
 
+from learning_stats import normalize_progress, record_attempt
 from words import WORDS, WORD_BY_ID
 
 
@@ -11,6 +12,13 @@ CARE_MAX = 3
 def new_game():
     return {
         "version": 1,
+        "pet_name": "Сниффер",
+        "lesson": None,
+        "word_stats": {},
+        "repeat_words": [],
+        "learned_order": [],
+        "reviews": [],
+        "active_review": None,
         "session": 0,
         "correct_answers": 0,
         "cards": {},
@@ -27,6 +35,8 @@ def normalize_game(raw):
     game = new_game()
     if not isinstance(raw, dict):
         return game
+    if isinstance(raw.get("pet_name"), str):
+        game["pet_name"] = clean_pet_name(raw["pet_name"]) or "Сниффер"
     for key in ("session", "correct_answers", "feedings", "garden_plants"):
         value = raw.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -53,7 +63,37 @@ def normalize_game(raw):
                 "correct_sessions": sessions,
             }
     game["garden_plants"] = min(game["garden_plants"], mastered_count(game) // 15)
+    lesson = raw.get("lesson")
+    if isinstance(lesson, dict):
+        queue = lesson.get("queue")
+        index = lesson.get("index")
+        if (isinstance(queue, list) and 0 < len(queue) <= 150
+                and all(isinstance(word, str) and word in WORD_BY_ID for word in queue)
+                and type(index) is int and 0 <= index < len(queue)):
+            game["lesson"] = {
+                "queue": queue[:], "index": index,
+                "phase": lesson.get("phase") if lesson.get("phase") in ("intro", "quiz", "result") else "intro",
+                "mode": "spelling" if lesson.get("mode") == "spelling" else "meaning",
+                "correct": lesson.get("correct") is True,
+                "answers": max(0, min(len(queue), lesson.get("answers", 0))) if type(lesson.get("answers")) is int else 0,
+            }
+    normalize_progress(game, raw)
     return game
+
+
+def clean_pet_name(value):
+    return " ".join("".join(char for char in value if char.isprintable()).split())[:20]
+
+
+def growth_remaining(game):
+    """Return the next growth goal without mixing answers and learned words."""
+    if not hatch_complete(game):
+        return "answers", max(0, 5 - game["correct_answers"])
+    learned = mastered_count(game)
+    for goal in (40, 80, 120):
+        if learned < goal:
+            return "words", goal - learned
+    return "complete", 0
 
 
 def record_for(game, word_id):
@@ -117,13 +157,17 @@ def record_answer(game, word_id, correct):
     """Return True only when this answer newly masters the word."""
     record = record_for(game, word_id)
     record["seen"] = True
+    record_attempt(game, word_id, correct)
     if not correct:
         return False
     was_mastered = mastered(game, word_id)
     game["correct_answers"] += 1
     if game["session"] not in record["correct_sessions"]:
         record["correct_sessions"].append(game["session"])
-    return not was_mastered and mastered(game, word_id)
+    newly_mastered = not was_mastered and mastered(game, word_id)
+    if newly_mastered and word_id not in game["learned_order"]:
+        game["learned_order"].append(word_id)
+    return newly_mastered
 
 
 def finish_session(game):

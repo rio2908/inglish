@@ -1,5 +1,6 @@
 import configparser
 from pathlib import Path
+import struct
 import unittest
 
 
@@ -7,6 +8,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AndroidConfigTests(unittest.TestCase):
+    def test_inglish_branding_keeps_the_existing_android_identity(self):
+        config = configparser.ConfigParser()
+        config.read(ROOT / "buildozer.spec", encoding="utf-8")
+        app = config["app"]
+        self.assertEqual(app["title"], "Inglish")
+        self.assertEqual(app["package.domain"] + "." + app["package.name"], "org.game.sniffergarden")
+        for key, size in (("icon.filename", (512, 512)),
+                          ("icon.adaptive_foreground.filename", (432, 432)),
+                          ("icon.adaptive_background.filename", (432, 432))):
+            with self.subTest(key=key):
+                content = (ROOT / app[key]).read_bytes()
+                self.assertEqual(content[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(struct.unpack(">II", content[16:24]), size)
+
     def test_android_stack_matches_working_mathcraft_configuration(self):
         config = configparser.ConfigParser()
         config.read(ROOT / "buildozer.spec", encoding="utf-8")

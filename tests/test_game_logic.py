@@ -22,7 +22,7 @@ class GameLogicTests(unittest.TestCase):
             self.assertEqual(words[english]["ru"], russian)
             self.assertEqual(words[english]["chapter"], 0)
 
-    def test_egg_hatches_after_five_correct_answers_but_learning_needs_recall(self):
+    def test_egg_cracks_gradually_and_hatches_after_thirty_mastered_words(self):
         game = new_game()
         first = start_session(game)
         self.assertEqual(len(first), 5)
@@ -30,25 +30,26 @@ class GameLogicTests(unittest.TestCase):
             self.assertFalse(record_answer(game, word_id, False))
             self.assertEqual(game["correct_answers"], index - 1)
             self.assertFalse(record_answer(game, word_id, True))
-            self.assertEqual(egg_frame(game), min(index, 4))
-        self.assertTrue(hatch_complete(game))
-        self.assertEqual(growth_stage(game), 1)
+            self.assertEqual(egg_frame(game), 0)
+        self.assertFalse(hatch_complete(game))
+        self.assertEqual(growth_stage(game), 0)
         self.assertEqual(mastered_count(game), 0)
-        start_session(game)
-        for word_id in first:
-            record_answer(game, word_id, True)
-        self.assertEqual(mastered_count(game), 5)
+        for count in range(31):
+            game["cards"] = {word["id"]: {"seen": True, "correct_sessions": [1, 2]} for word in WORDS[:count]}
+            self.assertEqual(egg_frame(game), min(count // 6, 4))
+            self.assertEqual(hatch_complete(game), count >= 30)
+        self.assertEqual(growth_stage(game), 1)
 
     def test_care_controls_garden_discovery_without_erasing_words(self):
         game = new_game()
         game["correct_answers"] = 5
         game["session"] = 1
-        for word in WORDS[:15]:
+        for word in WORDS[:30]:
             record_answer(game, word["id"], True)
         game["session"] = 2
-        for word in WORDS[:15]:
+        for word in WORDS[:30]:
             record_answer(game, word["id"], True)
-        self.assertEqual(mastered_count(game), 15)
+        self.assertEqual(mastered_count(game), 30)
         finish_session(game)
         finish_session(game)
         finish_session(game)
@@ -62,7 +63,7 @@ class GameLogicTests(unittest.TestCase):
         self.assertTrue(clean(game))
         self.assertTrue(explore(game))
         self.assertEqual(game["garden_plants"], 1)
-        self.assertEqual(mastered_count(game), 15)
+        self.assertEqual(mastered_count(game), 30)
 
     def test_loaded_progress_is_bounded_and_unknown_words_are_discarded(self):
         game = normalize_game({
@@ -73,6 +74,22 @@ class GameLogicTests(unittest.TestCase):
         self.assertEqual(mastered_count(game), 1)
         self.assertEqual(game["care"], {"food": 0, "joy": 3, "clean": 2})
         self.assertEqual(game["garden_plants"], 0)
+
+    def test_growth_notice_is_created_only_at_the_four_thirty_word_transitions(self):
+        game = new_game()
+        game["session"] = 1
+        for word in WORDS:
+            record_answer(game, word["id"], True)
+        game["session"] = 2
+        transitions = []
+        for count, word in enumerate(WORDS, start=1):
+            record_answer(game, word["id"], True)
+            if game["growth_notice"]:
+                transitions.append((count, game["growth_notice"]["before"], game["growth_notice"]["after"]))
+                game["growth_notice"] = None
+        self.assertEqual(transitions, [(30, 0, 1), (60, 1, 2), (90, 2, 3), (120, 3, 4)])
+        record_answer(game, WORDS[0]["id"], True)
+        self.assertIsNone(game["growth_notice"])
 
 
 if __name__ == "__main__":

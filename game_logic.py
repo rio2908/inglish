@@ -1,12 +1,15 @@
 """Saveable game rules independent from pygame."""
 
 import random
+from grammar import form_choices
 
 from learning_stats import normalize_progress, record_attempt
-from words import WORDS, WORD_BY_ID
+from words import ALL_WORDS, WORD_BY_ID, words_for_species
+from zoo import current_species, new_zoo, normalize_zoo, pet_learned_count, record_pet_answer
 
 
 CARE_MAX = 3
+GROWTH_THRESHOLDS = (30, 60, 90, 120)
 
 
 def new_game():
@@ -14,6 +17,7 @@ def new_game():
         "version": 1,
         "pet_name": "Сниффер",
         "lesson": None,
+        "growth_notice": None,
         "word_stats": {},
         "repeat_words": [],
         "learned_order": [],
@@ -27,6 +31,7 @@ def new_game():
         "poop": False,
         "garden_plants": 0,
         "last_food": "seed",
+        "zoo": new_zoo(),
     }
 
 
@@ -57,12 +62,12 @@ def normalize_game(raw):
             sessions = record.get("correct_sessions", [])
             if not isinstance(sessions, list):
                 sessions = []
-            sessions = sorted({s for s in sessions if isinstance(s, int) and s > 0})
+            sessions = sorted({s for s in sessions if type(s) is int and s > 0})
             game["cards"][word_id] = {
                 "seen": bool(record.get("seen", False)),
                 "correct_sessions": sessions,
             }
-    game["garden_plants"] = min(game["garden_plants"], mastered_count(game) // 15)
+    game["garden_plants"] = min(game["garden_plants"], 10, mastered_count(game) // 15)
     lesson = raw.get("lesson")
     if isinstance(lesson, dict):
         queue = lesson.get("queue")
@@ -77,7 +82,17 @@ def normalize_game(raw):
                 "correct": lesson.get("correct") is True,
                 "answers": max(0, min(len(queue), lesson.get("answers", 0))) if type(lesson.get("answers")) is int else 0,
             }
+    game["zoo"] = normalize_zoo(raw.get("zoo"))
     normalize_progress(game, raw)
+    notice = raw.get("growth_notice")
+    if (isinstance(notice, dict) and notice.get("species") == current_species(game)
+            and notice.get("cycle", 0) == game["zoo"]["cycle"]
+            and type(notice.get("before")) is int and 0 <= notice["before"] < 4
+            and type(notice.get("after")) is int
+            and notice.get("after") == notice["before"] + 1
+            and growth_stage(game) >= notice["after"]):
+        game["growth_notice"] = {"species": current_species(game), "cycle": game["zoo"]["cycle"],
+                                 "before": notice["before"], "after": notice["after"]}
     return game
 
 
@@ -88,9 +103,9 @@ def clean_pet_name(value):
 def growth_remaining(game):
     """Return the next growth goal without mixing answers and learned words."""
     if not hatch_complete(game):
-        return "answers", max(0, 5 - game["correct_answers"])
-    learned = mastered_count(game)
-    for goal in (40, 80, 120):
+        return "hatch_words", max(0, GROWTH_THRESHOLDS[0] - pet_learned_count(game))
+    learned = pet_learned_count(game)
+    for goal in GROWTH_THRESHOLDS[1:]:
         if learned < goal:
             return "words", goal - learned
     return "complete", 0
@@ -106,31 +121,31 @@ def mastered(game, word_id):
 
 
 def mastered_count(game):
-    return sum(mastered(game, word["id"]) for word in WORDS)
+    return sum(mastered(game, word["id"]) for word in ALL_WORDS)
 
 
 def introduced_count(game):
-    return sum(bool(game["cards"].get(word["id"], {}).get("seen")) for word in WORDS)
+    return sum(bool(game["cards"].get(word["id"], {}).get("seen")) for word in ALL_WORDS)
 
 
 def hatch_complete(game):
-    return game["correct_answers"] >= 5
+    return pet_learned_count(game) >= GROWTH_THRESHOLDS[0]
 
 
 def egg_frame(game):
-    return min(game["correct_answers"], 4)
+    return min(pet_learned_count(game) // max(1, GROWTH_THRESHOLDS[0] // 5), 4)
 
 
 def growth_stage(game):
     """0 egg, 1 baby, 2 youngster, 3 adult, 4 flowered Sniffer."""
     if not hatch_complete(game):
         return 0
-    learned = mastered_count(game)
-    if learned >= 120:
+    learned = pet_learned_count(game)
+    if learned >= GROWTH_THRESHOLDS[3]:
         return 4
-    if learned >= 80:
+    if learned >= GROWTH_THRESHOLDS[2]:
         return 3
-    if learned >= 40:
+    if learned >= GROWTH_THRESHOLDS[1]:
         return 2
     return 1
 
@@ -138,12 +153,18 @@ def growth_stage(game):
 def start_session(game, rng=None):
     rng = rng or random
     game["session"] += 1
-    seen_unmastered = [w["id"] for w in WORDS if game["cards"].get(w["id"], {}).get("seen") and not mastered(game, w["id"])]
+    pool = words_for_species(current_species(game))
+    if game["zoo"]["replay"]:
+        cards = game["zoo"]["pet_cards"]
+        waiting = [word["id"] for word in pool if len(cards.get(word["id"], {}).get("correct_sessions", [])) < 2]
+        rng.shuffle(waiting)
+        return waiting[:6] or rng.sample([word["id"] for word in pool], 6)
+    seen_unmastered = [w["id"] for w in pool if game["cards"].get(w["id"], {}).get("seen") and not mastered(game, w["id"])]
     rng.shuffle(seen_unmastered)
     review = seen_unmastered[:5]
-    new = [w["id"] for w in WORDS if not game["cards"].get(w["id"], {}).get("seen")][:5]
+    new = [w["id"] for w in pool if not game["cards"].get(w["id"], {}).get("seen")][:5]
     if len(review) + len(new) < 6:
-        known = [w["id"] for w in WORDS if mastered(game, w["id"])]
+        known = [w["id"] for w in pool if mastered(game, w["id"])]
         rng.shuffle(known)
         review.extend(known[:6 - len(review) - len(new)])
     return review + new
@@ -154,10 +175,12 @@ def mark_seen(game, word_id):
 
 
 def record_answer(game, word_id, correct):
-    """Return True only when this answer newly masters the word."""
+    """Track global learning and the current pet; return its newly learned word."""
+    before_stage = growth_stage(game)
     record = record_for(game, word_id)
     record["seen"] = True
     record_attempt(game, word_id, correct)
+    newly_pet_learned = record_pet_answer(game, word_id, correct)
     if not correct:
         return False
     was_mastered = mastered(game, word_id)
@@ -167,7 +190,11 @@ def record_answer(game, word_id, correct):
     newly_mastered = not was_mastered and mastered(game, word_id)
     if newly_mastered and word_id not in game["learned_order"]:
         game["learned_order"].append(word_id)
-    return newly_mastered
+    after_stage = growth_stage(game)
+    if after_stage > before_stage:
+        game["growth_notice"] = {"species": current_species(game), "cycle": game["zoo"]["cycle"],
+                                 "before": before_stage, "after": after_stage}
+    return newly_pet_learned if game["zoo"]["replay"] else newly_mastered
 
 
 def finish_session(game):
@@ -204,7 +231,7 @@ def clean(game):
 
 
 def can_explore(game):
-    return hatch_complete(game) and all(value > 0 for value in game["care"].values()) and game["garden_plants"] < mastered_count(game) // 15
+    return hatch_complete(game) and all(value > 0 for value in game["care"].values()) and game["garden_plants"] < min(10, mastered_count(game) // 15)
 
 
 def explore(game):
@@ -218,9 +245,13 @@ def explore(game):
 
 def choice_ids(word_id, rng=None):
     rng = rng or random
+    contextual = form_choices(word_id, rng)
+    if contextual is not None:
+        return contextual
     word = WORD_BY_ID[word_id]
-    same = [w["id"] for w in WORDS if w["chapter"] == word["chapter"] and w["id"] != word_id and w["ru"] != word["ru"]]
-    other = [w["id"] for w in WORDS if w["chapter"] != word["chapter"] and w["ru"] != word["ru"]]
+    pool = words_for_species(word["species"])
+    same = [w["id"] for w in pool if w["chapter"] == word["chapter"] and w["id"] != word_id and w["ru"] != word["ru"]]
+    other = [w["id"] for w in pool if w["chapter"] != word["chapter"] and w["ru"] != word["ru"]]
     rng.shuffle(same)
     rng.shuffle(other)
     options = [word_id] + same[:2]

@@ -30,7 +30,7 @@ class PetGame:
         elif stage == 4:
             self.message = "Выбери грядку и посади семечко."
         elif stage == 1:
-            self.message = "Нажми на куст. Сниффер поможет своим нюхом!"
+            self.message = "Нажми на куст. Питомец поможет своим нюхом!"
         else:
             self.message = "Найди, откуда выглядывает твой питомец!"
 
@@ -46,7 +46,7 @@ class PetGame:
         self.phase = "show"
         self.input_index = 0
         self.show_start = now
-        self.message = "Смотри, что делает сниффер, и запоминай!"
+        self.message = "Смотри, что делает питомец, и запоминай!"
 
     def shown_move(self, now):
         if self.phase != "show":
@@ -72,7 +72,7 @@ class PetGame:
                 self.target = self.rng.choice(choices)
                 self.last_choice = None
                 self.phase = "search"
-                self.message = "Теперь поищем ещё!" if self.stage == 1 else "Сниффер спрятался в другом месте!"
+                self.message = "Теперь поищем ещё!" if self.stage == 1 else "Питомец спрятался в другом месте!"
 
     def _celebrate(self, now, message):
         self.phase = "celebrate"
@@ -100,11 +100,11 @@ class PetGame:
                     self.message = "Тут пусто. Посмотри, где выглядывает нос или хвост!"
                 return False
             self.hits += 1
-            self._celebrate(now, "Нашли угощение! Сниффер довольно сопит!" if self.stage == 1 else "Нашёл! Питомец радостно выскакивает!")
+            self._celebrate(now, "Нашли угощение! Питомец радуется!" if self.stage == 1 else "Нашёл! Питомец радостно выскакивает!")
         elif self.stage == 3:
             if index != self.sequence[self.input_index]:
                 self._show_sequence(now)
-                self.message = "Ничего страшного! Сниффер покажет ещё раз."
+                self.message = "Ничего страшного! Питомец покажет ещё раз."
                 return False
             self.input_index += 1
             if self.input_index == len(self.sequence):
@@ -124,7 +124,7 @@ class PetGame:
             if self.plants[self.selected] == 3:
                 self.hits += 1
                 if self.hits == 3:
-                    self._celebrate(now, "Все цветы распустились! Сниффер танцует от радости!")
+                    self._celebrate(now, "Все цветы распустились! Питомец танцует от радости!")
                 else:
                     self.selected = next(i for i, plant in enumerate(self.plants) if plant < 3)
                     self.message = "Красота! Посадим следующий цветок."

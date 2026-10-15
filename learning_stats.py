@@ -1,8 +1,10 @@
 """Learning statistics and resumable, non-punitive checks every 30 learned words."""
 
 import random
+from grammar import form_choices
 
-from words import WORDS, WORD_BY_ID
+from words import ALL_WORDS, WORD_BY_ID, words_for_species
+from zoo import SPECIES_NAMES, current_species, pet_learned_count
 
 
 MILESTONES = (30, 60, 90, 120, 150)
@@ -10,11 +12,26 @@ REVIEW_SIZE = 6
 COUNTERS = ("lesson_attempts", "lesson_correct", "review_attempts", "review_correct")
 
 
+def review_learned_ids(game):
+    pool = words_for_species(current_species(game))
+    cards = game["zoo"]["pet_cards"] if game["zoo"]["replay"] else game["cards"]
+    learned = {word["id"] for word in pool if len(cards.get(word["id"], {}).get("correct_sessions", [])) >= 2}
+    return [word_id for word_id in learned_ids(game) if word_id in learned]
+
+
+def review_species(review):
+    return review.get("species", "sniffer")
+
+
+def review_cycle(review):
+    return review.get("cycle", 0)
+
+
 def learned_ids(game):
-    known = {word["id"] for word in WORDS
+    known = {word["id"] for word in ALL_WORDS
              if len(game["cards"].get(word["id"], {}).get("correct_sessions", [])) >= 2}
     ordered = []
-    for word_id in game.get("learned_order", []) + [word["id"] for word in WORDS]:
+    for word_id in game.get("learned_order", []) + [word["id"] for word in ALL_WORDS]:
         if word_id in known and word_id not in ordered:
             ordered.append(word_id)
     return ordered
@@ -55,21 +72,37 @@ def normalize_progress(game, raw):
             if (isinstance(word_id, str) and word_id in WORD_BY_ID and word_id not in game["repeat_words"]
                     and (game["cards"].get(word_id, {}).get("seen") or word_id in game["word_stats"])):
                 game["repeat_words"].append(word_id)
-    count = len(game["learned_order"])
+    count = pet_learned_count(game)
+    species = current_species(game)
+    archived = {resident["species"] for resident in game["zoo"]["residents"]}
     results = raw.get("reviews")
     if isinstance(results, list):
         for result in results:
             if not isinstance(result, dict):
                 continue
             milestone, score = result.get("milestone"), result.get("score")
-            if (type(milestone) is int and milestone in MILESTONES and milestone <= count
+            owner = review_species(result)
+            cycle = review_cycle(result)
+            limit = 150 if isinstance(owner, str) and owner in archived else count if owner == species else 0
+            if (isinstance(owner, str) and owner in SPECIES_NAMES
+                    and type(cycle) is int and 0 <= cycle <= game["zoo"]["serial"]
+                    and type(milestone) is int and milestone in MILESTONES and milestone <= limit
                     and type(score) is int and 0 <= score <= REVIEW_SIZE
                     and result.get("total") == REVIEW_SIZE
-                    and not any(item["milestone"] == milestone for item in game["reviews"])):
-                game["reviews"].append({"milestone": milestone, "score": score, "total": REVIEW_SIZE})
+                    and not any(item["milestone"] == milestone and review_species(item) == owner and review_cycle(item) == cycle for item in game["reviews"])):
+                clean_result = {"milestone": milestone, "score": score, "total": REVIEW_SIZE}
+                if owner != "sniffer":
+                    clean_result["species"] = owner
+                if cycle:
+                    clean_result["cycle"] = cycle
+                game["reviews"].append(clean_result)
     game["reviews"].sort(key=lambda item: item["milestone"])
     active = raw.get("active_review")
     if not isinstance(active, dict):
+        return
+    if active.get("species", species) != species:
+        return
+    if review_cycle(active) != game["zoo"]["cycle"]:
         return
     milestone, queue, answers = active.get("milestone"), active.get("queue"), active.get("answers")
     if (type(milestone) is not int or milestone not in MILESTONES or milestone > count
@@ -89,16 +122,20 @@ def normalize_progress(game, raw):
         phase = "quiz"
     if len(answers) == REVIEW_SIZE and phase == "quiz":
         phase = "feedback"
-    if any(item["milestone"] == milestone for item in game["reviews"]) and len(answers) < REVIEW_SIZE:
+    if any(item["milestone"] == milestone and review_species(item) == species and review_cycle(item) == game["zoo"]["cycle"] for item in game["reviews"]) and len(answers) < REVIEW_SIZE:
         return
     game["active_review"] = {"milestone": milestone, "queue": queue[:], "answers": answers[:], "phase": phase}
+    if species != "sniffer":
+        game["active_review"]["species"] = species
+    if game["zoo"]["cycle"]:
+        game["active_review"]["cycle"] = game["zoo"]["cycle"]
     if len(answers) == REVIEW_SIZE:
         _finish_review(game)
 
 
 def pending_review(game):
-    completed = {item["milestone"] for item in game["reviews"]}
-    count = len(learned_ids(game))
+    completed = {item["milestone"] for item in game["reviews"] if review_species(item) == current_species(game) and review_cycle(item) == game["zoo"]["cycle"]}
+    count = pet_learned_count(game)
     return next((milestone for milestone in MILESTONES if milestone <= count and milestone not in completed), None)
 
 
@@ -111,13 +148,17 @@ def start_review(game, rng=None):
     rng = rng or random
     game["learned_order"] = learned_ids(game)
     queue = game["repeat_words"][:REVIEW_SIZE]
-    candidates = [word_id for word_id in game["learned_order"][:milestone] if word_id not in queue]
+    candidates = [word_id for word_id in review_learned_ids(game)[:milestone] if word_id not in queue]
     queue += rng.sample(candidates, REVIEW_SIZE - len(queue))
     rng.shuffle(queue)
     game["active_review"] = {
         "milestone": milestone, "queue": queue,
         "answers": [], "phase": "quiz",
     }
+    if current_species(game) != "sniffer":
+        game["active_review"]["species"] = current_species(game)
+    if game["zoo"]["cycle"]:
+        game["active_review"]["cycle"] = game["zoo"]["cycle"]
     return game["active_review"]
 
 
@@ -131,7 +172,10 @@ def review_choices(game, rng=None):
         return []
     rng = rng or random
     expected = review["queue"][len(review["answers"])]
-    eligible = list(dict.fromkeys(learned_ids(game)[:review["milestone"]] + review["queue"]))
+    contextual = form_choices(expected, rng)
+    if contextual is not None:
+        return contextual
+    eligible = list(dict.fromkeys(review_learned_ids(game)[:review["milestone"]] + review["queue"]))
     candidates = [word_id for word_id in eligible
                   if word_id != expected and WORD_BY_ID[word_id]["ru"] != WORD_BY_ID[expected]["ru"]]
     options = [expected] + rng.sample(candidates, min(2, len(candidates)))
@@ -141,14 +185,19 @@ def review_choices(game, rng=None):
 
 def _finish_review(game):
     review = game["active_review"]
-    if not any(item["milestone"] == review["milestone"] for item in game["reviews"]):
-        game["reviews"].append({"milestone": review["milestone"], "score": review_score(review), "total": REVIEW_SIZE})
+    if not any(item["milestone"] == review["milestone"] and review_species(item) == current_species(game) and review_cycle(item) == game["zoo"]["cycle"] for item in game["reviews"]):
+        result = {"milestone": review["milestone"], "score": review_score(review), "total": REVIEW_SIZE}
+        if current_species(game) != "sniffer":
+            result["species"] = current_species(game)
+        if game["zoo"]["cycle"]:
+            result["cycle"] = game["zoo"]["cycle"]
+        game["reviews"].append(result)
         game["reviews"].sort(key=lambda item: item["milestone"])
 
 
 def answer_review(game, chosen_id):
     review = game["active_review"]
-    if review is None or review["phase"] != "quiz" or chosen_id not in WORD_BY_ID:
+    if review is None or review["phase"] != "quiz" or not isinstance(chosen_id, str) or chosen_id not in WORD_BY_ID:
         return False
     index = len(review["answers"])
     if index >= len(review["queue"]):

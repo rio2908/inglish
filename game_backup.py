@@ -13,11 +13,12 @@ IMPORT_REQUEST = 4102
 
 
 class ProfilePicker:
-    def __init__(self):
+    def __init__(self, decoder=read_backup_bytes):
         self.pending = None
         self.result = None
         self._bound = False
         self.web_pending = False
+        self.decoder = decoder
 
     def _android(self):
         from android import activity
@@ -28,10 +29,10 @@ class ProfilePicker:
         if request_code in (EXPORT_REQUEST, IMPORT_REQUEST):
             self.result = (request_code, result_code, intent)
 
-    def start(self, export, game):
+    def start(self, export, game, player=None):
         if self.pending is not None or self.web_pending:
             return
-        payload = make_backup_bytes(game) if export else None
+        payload = make_backup_bytes(game, player) if export else None
         if sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ:
             activity, current, Intent = self._android()
             if not self._bound:
@@ -41,7 +42,7 @@ class ProfilePicker:
             intent.setType("application/json")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             if export:
-                intent.putExtra(Intent.EXTRA_TITLE, "Inglish-profile.json")
+                intent.putExtra(Intent.EXTRA_TITLE, "EnglishCraft-profile.json")
             self.pending = payload if export else True
             try:
                 current.startActivityForResult(intent, EXPORT_REQUEST if export else IMPORT_REQUEST)
@@ -55,7 +56,7 @@ class ProfilePicker:
                     const blob = new Blob([%s], {type:'application/json'});
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a'); a.href = url;
-                    a.download = 'Inglish-profile.json';
+                    a.download = 'EnglishCraft-profile.json';
                     document.body.appendChild(a); a.click(); a.remove();
                     setTimeout(() => URL.revokeObjectURL(url), 10000);
                 })()""" % json.dumps(payload.decode("utf-8")))
@@ -85,7 +86,7 @@ class ProfilePicker:
             root.withdraw()
             try:
                 if export:
-                    path = filedialog.asksaveasfilename(title="Выгрузить профиль", initialfile="Inglish-profile.json",
+                    path = filedialog.asksaveasfilename(title="Выгрузить профиль", initialfile="EnglishCraft-profile.json",
                                                       defaultextension=".json", filetypes=[("JSON", "*.json")])
                     if path:
                         Path(path).write_bytes(payload)
@@ -95,7 +96,7 @@ class ProfilePicker:
                     if path:
                         with Path(path).open("rb") as file:
                             content = file.read(MAX_BACKUP_BYTES + 1)
-                        self.result = ("Профиль прочитан.", read_backup_bytes(content))
+                        self.result = ("Профиль прочитан.", self.decoder(content))
             finally:
                 root.destroy()
 
@@ -113,7 +114,7 @@ class ProfilePicker:
                     return "Выбор файла отменён.", None
                 if result.get("error"):
                     raise ValueError(result["error"])
-                return "Профиль прочитан.", read_backup_bytes(result["content"].encode("utf-8"))
+                return "Профиль прочитан.", self.decoder(result["content"].encode("utf-8"))
             except Exception as error:
                 return f"Ошибка профиля: {error}", None
         if self.result is None:
@@ -141,6 +142,6 @@ class ProfilePicker:
                 return "Профиль сохранён. Сохраните файл перед удалением игры.", None
             with os.fdopen(fd, "rb") as file:
                 content = file.read(MAX_BACKUP_BYTES + 1)
-            return "Профиль прочитан.", read_backup_bytes(content)
+            return "Профиль прочитан.", self.decoder(content)
         except Exception as error:
             return f"Ошибка профиля: {error}", None

@@ -1,4 +1,4 @@
-"""Generate Inglish launcher icons from the game's own transparent pixel sprite."""
+"""Generate EnglishCraft launcher icons from the game's own transparent pixel sprite."""
 
 import os
 from pathlib import Path

@@ -161,9 +161,20 @@ $s.Dispose()
             self.error = "Нет записи слова или доступного синтезатора английской речи."
         return False
 
-    def shutdown(self):
+    def stop(self):
+        self.pending = None
+        self.error = ""
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
+        self.process = None
+        if self.tts:
+            try:
+                self.tts.stop()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        self.stop()
         if self.tts:
             try:
                 self.tts.shutdown()

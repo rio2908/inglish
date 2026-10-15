@@ -1,5 +1,5 @@
 [app]
-title = Inglish
+title = EnglishCraft
 package.name = sniffergarden
 package.domain = org.game
 source.dir = .

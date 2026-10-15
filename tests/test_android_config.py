@@ -12,7 +12,7 @@ class AndroidConfigTests(unittest.TestCase):
         config = configparser.ConfigParser()
         config.read(ROOT / "buildozer.spec", encoding="utf-8")
         app = config["app"]
-        self.assertEqual(app["title"], "Inglish")
+        self.assertEqual(app["title"], "EnglishCraft")
         self.assertEqual(app["package.domain"] + "." + app["package.name"], "org.game.sniffergarden")
         for key, size in (("icon.filename", (512, 512)),
                           ("icon.adaptive_foreground.filename", (432, 432)),

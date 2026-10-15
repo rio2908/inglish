@@ -109,15 +109,66 @@ class LearningStatsTests(unittest.TestCase):
         self.assertEqual(word_status(game, "cat"), "Не открыто")
         game["session"] = 1
         record_answer(game, "cat", False)
-        self.assertEqual(word_status(game, "cat"), "Повторяем")
+        self.assertEqual(word_status(game, "cat"), "Повторить")
         record_answer(game, "cat", True)
         game["session"] = 2
         record_answer(game, "cat", True)
-        self.assertEqual(word_status(game, "cat"), "Выучено")
+        self.assertEqual(word_status(game, "cat"), "Повторить")
         self.assertEqual(statistics(game)["accuracy"], 67)
         self.assertEqual(game["word_stats"]["cat"]["lesson_attempts"], 3)
         self.assertEqual(game["word_stats"]["cat"]["lesson_correct"], 2)
         self.assertEqual(game["learned_order"], ["cat"])
+
+    def test_mistakes_are_prioritized_even_if_the_word_is_not_mastered_yet(self):
+        game = learned_game(30)
+        difficult = WORDS[35]["id"]
+        record_answer(game, difficult, False)
+        record_answer(game, difficult, True)
+        self.assertIn(difficult, game["repeat_words"])
+        self.assertNotIn(difficult, learned_ids(game))
+        review = start_review(game, random.Random(2))
+        self.assertIn(difficult, review["queue"])
+        game = read_backup_bytes(make_backup_bytes(game))
+        self.assertIn(difficult, game["active_review"]["queue"])
+        for word_id in game["active_review"]["queue"][:]:
+            answer_review(game, word_id)
+            advance_review(game)
+        self.assertNotIn(difficult, game["repeat_words"])
+        self.assertNotIn(difficult, learned_ids(game))
+        self.assertEqual(word_status(game, difficult), "Повторяем")
+        # Reload must keep the completed check even after its successful word left the error list.
+        self.assertEqual(read_backup_bytes(make_backup_bytes(game)), game)
+
+    def test_failed_review_words_return_at_the_next_thirty_word_checkpoint(self):
+        game = learned_game(60)
+        review = complete_review(game, correct=4)
+        missed = review["queue"][4:]
+        self.assertEqual(set(game["repeat_words"]), set(missed))
+        game["active_review"] = None
+        game = normalize_game(game)
+        second = start_review(game, random.Random(17))
+        self.assertEqual(second["milestone"], 60)
+        self.assertTrue(set(missed) <= set(second["queue"]))
+        for word_id in second["queue"][:]:
+            answer_review(game, word_id)
+            advance_review(game)
+        self.assertEqual(game["repeat_words"], [])
+
+    def test_large_error_backlog_is_rotated_without_growing_the_test(self):
+        game = learned_game(60)
+        difficult = [word["id"] for word in WORDS[:8]]
+        for word_id in difficult:
+            record_answer(game, word_id, False)
+        first = start_review(game, random.Random(1))
+        self.assertEqual(set(first["queue"]), set(difficult[:6]))
+        for expected in first["queue"][:]:
+            wrong = next(word["id"] for word in WORDS if word["id"] != expected)
+            answer_review(game, wrong)
+            advance_review(game)
+        game["active_review"] = None
+        second = start_review(game, random.Random(5))
+        self.assertEqual(len(second["queue"]), 6)
+        self.assertTrue(set(difficult[6:]) <= set(second["queue"]))
 
     def test_corrupt_statistics_and_active_review_are_sanitized(self):
         raw = learned_game(30)

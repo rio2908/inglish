@@ -15,8 +15,8 @@ we|уи|мы
 they|зэй|они
 hello|хэлоу|привет
 bye|бай|пока
-is|из|есть (он, она)
-are|ар|есть (они)
+is|из|быть (он, она, оно)
+are|ар|быть (ты, мы, они)
 have|хэв|иметь
 has|хэз|имеет
 my|май|мой
@@ -178,9 +178,9 @@ where|уэр|где
 ]
 
 
-def load_words():
+def load_words(chapters=None, species="sniffer"):
     words = []
-    for chapter_index, (chapter_name, raw) in enumerate(CHAPTERS):
+    for chapter_index, (chapter_name, raw) in enumerate(CHAPTERS if chapters is None else chapters):
         lines = [line.strip() for line in raw.strip().splitlines() if line.strip()]
         if len(lines) != 15:
             raise ValueError(f"Chapter {chapter_name!r} has {len(lines)} words, expected 15")
@@ -193,6 +193,7 @@ def load_words():
                 "ru": russian,
                 "chapter": chapter_index,
                 "chapter_name": chapter_name,
+                "species": species,
             })
     if len(words) != 150 or len({word["id"] for word in words}) != 150:
         raise ValueError("The word bank must contain 150 distinct English words")
@@ -200,4 +201,16 @@ def load_words():
 
 
 WORDS = load_words()
-WORD_BY_ID = {word["id"]: word for word in WORDS}
+from curricula import extra_chapters
+
+CHAPTERS_BY_SPECIES = {"sniffer": CHAPTERS, **extra_chapters()}
+WORD_BANKS = {species: WORDS if species == "sniffer" else load_words(chapters, species)
+              for species, chapters in CHAPTERS_BY_SPECIES.items()}
+ALL_WORDS = [word for bank in WORD_BANKS.values() for word in bank]
+WORD_BY_ID = {word["id"]: word for word in ALL_WORDS}
+if len(ALL_WORDS) != 900 or len(WORD_BY_ID) != 900:
+    raise ValueError("The six curricula must contain 900 distinct English entries")
+
+
+def words_for_species(species):
+    return WORD_BANKS[species]

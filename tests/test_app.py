@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import unittest
+import tempfile
 from unittest.mock import patch, Mock
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -16,19 +17,33 @@ import main
 from speech import Speech
 from words import WORDS
 from learning_stats import statistics
+from player_profiles import PlayerStore
+from zoo import SPECIES, advance_final_test, answer_final_test, current_species, pet_learned_count, start_final_test
+from vocabulary import learned_vocabulary
+import copy
 
 
 class AppTests(unittest.TestCase):
+    def certify_pet(self):
+        exam = start_final_test(self.app.game)
+        for expected in exam["queue"][:]:
+            answer_final_test(self.app.game, expected)
+            advance_final_test(self.app.game)
+
     def setUp(self):
-        self.save = patch("main.write_game").start()
-        patch("main.load_game", side_effect=new_game).start()
-        self.app = main.GameApp()
+        self.directory = tempfile.TemporaryDirectory()
+        self.store = PlayerStore(Path(self.directory.name) / "players.json")
+        self.identity = self.store.create_player("Тестовый игрок")
+        self.app = main.GameApp(profile_store=self.store)
+        self.app.enter_player(self.identity)
+        self.save = patch.object(self.store, "save_game", wraps=self.store.save_game).start()
         self.app.speech.speak = Mock(return_value=True)
 
     def tearDown(self):
         self.app.speech.shutdown()
         pygame.quit()
         patch.stopall()
+        self.directory.cleanup()
 
     def test_name_input_is_saved_and_can_be_cancelled(self):
         self.app.open_profile()
@@ -108,7 +123,7 @@ class AppTests(unittest.TestCase):
         self.app.game = new_game()
         self.app.game["correct_answers"] = 5 if stage else 0
         self.app.game["care"]["joy"] = 0
-        learned = {0: 0, 1: 0, 2: 40, 3: 80, 4: 120}[stage]
+        learned = {0: 0, 1: 30, 2: 60, 3: 90, 4: 120}[stage]
         self.app.game["cards"] = {
             word["id"]: {"seen": True, "correct_sessions": [1, 2]}
             for word in WORDS[:learned]
@@ -190,6 +205,9 @@ class AppTests(unittest.TestCase):
         self.app.card_index = 0
         self.app.prepare_card()
         self.app.answer(target)
+        self.assertEqual(self.app.screen, "growth")
+        self.app.draw()
+        self.app.acknowledge_growth()
         self.app.next_card()
         self.assertEqual(self.app.screen, "review")
         self.assertEqual(self.app.game["active_review"]["milestone"], 30)
@@ -217,8 +235,9 @@ class AppTests(unittest.TestCase):
         self.app.submit_review(first)
         self.app.pause_review()
         saved = normalize_game(self.app.game)
-        with patch("main.load_game", return_value=saved):
-            restarted = main.GameApp()
+        self.store.save_game(self.identity, saved)
+        restarted = main.GameApp(profile_store=self.store)
+        restarted.enter_player(self.identity)
         try:
             self.assertEqual(restarted.screen, "review")
             self.assertEqual(restarted.game["active_review"]["phase"], "feedback")
@@ -240,6 +259,242 @@ class AppTests(unittest.TestCase):
         self.app.statistics_tab("words")
         self.app.stats_page = (len(WORDS) - 1) // 8
         self.app.draw()
+
+    def test_tapping_pet_emits_pixel_hearts_and_does_not_change_progress(self):
+        self.set_pet_stage(1)
+        self.app.screen = "home"
+        before = normalize_game(self.app.game)
+        with patch("pygame.time.get_ticks", return_value=1000):
+            self.app.draw()
+            self.app.click(self.app.pet_rect.center)
+        self.assertEqual(len(self.app.hearts.particles), 6)
+        with patch("pygame.time.get_ticks", return_value=1500):
+            self.app.draw()
+        self.assertEqual(self.app.pet_behavior.update(1, 1.5).action, "happy")
+        self.assertEqual(self.app.game["care"], before["care"])
+        self.assertEqual(self.app.game["correct_answers"], before["correct_answers"])
+        self.assertEqual(self.app.game["cards"], before["cards"])
+        self.assertEqual(self.app.hearts.frame(3), [])
+
+    def test_pixel_heart_has_two_lobes_and_a_point_without_font_glyphs(self):
+        with patch("pygame.font.Font", side_effect=AssertionError("A heart must not use a font")):
+            sprite = main.heart_sprite(3)
+        pink = (242, 91, 119)
+        self.assertEqual(sprite.get_at((3 * 3, 1 * 3))[:3], pink)
+        self.assertEqual(sprite.get_at((5 * 3, 1 * 3))[:3], pink)
+        self.assertNotEqual(sprite.get_at((4 * 3, 1 * 3))[:3], pink)
+        self.assertEqual(sprite.get_at((4 * 3, 6 * 3))[:3], pink)
+
+    def test_zoo_unlocks_only_the_next_pet_and_keeps_residents_viewable(self):
+        for session in (1, 2):
+            self.app.game["session"] = session
+            for word in WORDS:
+                main.record_answer(self.app.game, word["id"], True)
+        self.app.game["pet_name"] = "Пушок"
+        self.certify_pet()
+        self.app.open_zoo()
+        self.app.draw()
+        self.app.click((650, 560))
+        self.assertEqual(current_species(self.app.game), "axolotl")
+        self.assertEqual(pet_learned_count(self.app.game), 0)
+        self.assertEqual(len(self.app.game["zoo"]["residents"]), 1)
+        self.assertEqual(self.app.sprites.species, "axolotl")
+        self.app.draw()
+        self.assertTrue(all(pygame.Rect(0, 0, main.WIDTH, main.HEIGHT).contains(rect)
+                            for rect, _ in self.app.buttons))
+        self.app.inspect_resident(0)
+        self.app.draw()
+        self.assertEqual(self.app.game["zoo"]["residents"][0]["name"], "Пушок")
+        self.assertEqual(self.app.sprites.species, "axolotl")
+        self.app.screen = "home"
+        self.app.draw()
+        self.assertEqual(main.growth_stage(self.app.game), 0)
+
+    def test_zoo_shows_eggs_until_a_grown_pet_moves_in(self):
+        self.app.open_zoo()
+        original = self.app.sprites.scaled_species
+        with patch.object(self.app.sprites, "scaled_species", wraps=original) as render:
+            self.app.draw()
+            self.assertEqual([(call.args[0], call.args[1], call.args[2]) for call in render.call_args_list],
+                             [(species, "hatching", 0) for species, _ in SPECIES])
+        self.set_pet_stage(4)
+        self.app.open_zoo()
+        with patch.object(self.app.sprites, "scaled_species", wraps=original) as render:
+            self.app.draw()
+            self.assertTrue(all(call.args[1:3] == ("hatching", 0) for call in render.call_args_list))
+        for word in WORDS:
+            self.app.game["cards"][word["id"]] = {"seen": True, "correct_sessions": [1, 2]}
+        self.certify_pet()
+        self.app.settle_current_pet()
+        with patch.object(self.app.sprites, "scaled_species", wraps=original) as render:
+            self.app.draw()
+            calls = [(call.args[0], call.args[1], call.args[2]) for call in render.call_args_list]
+            self.assertEqual(calls[0], ("sniffer", "growth", 4))
+            self.assertEqual(calls[1], ("sniffer", "hatching", 0))
+            self.assertEqual(calls[2:], [(species, "hatching", 0) for species, _ in SPECIES[1:]])
+
+    def test_all_new_species_have_distinct_transparent_growth_and_animation_sprites(self):
+        adult_images = set()
+        for species, _ in SPECIES[1:]:
+            self.app.sprites.select_species(species)
+            for family, count in (("growth", 5), ("hatching", 5), ("walk", 6)):
+                for frame in range(count):
+                    image = self.app.sprites.scaled(family, frame, 240, 180)
+                    self.assertGreater(image.get_bounding_rect().width, 10)
+                    self.assertLessEqual(image.get_width(), 240)
+                    self.assertLessEqual(image.get_height(), 180)
+                    self.assertTrue(image.get_flags() & pygame.SRCALPHA)
+            frames = self.app.sprites.families[species]["walk"]
+            self.assertGreater(len({pygame.image.tobytes(image, "RGBA") for image in frames}), 1)
+            adult = self.app.sprites.scaled("growth", 4, 240, 180)
+            adult_images.add(pygame.image.tobytes(adult, "RGBA"))
+        self.assertEqual(len(adult_images), 5)
+
+    def test_growth_changes_the_picture_and_silhouette_not_just_its_size(self):
+        from creature_sprites import creature
+        for species, _ in SPECIES[1:]:
+            with self.subTest(species=species):
+                frames = [pygame.transform.scale(creature(species, stage), (64, 64)) for stage in range(1, 5)]
+                for before, after in zip(frames, frames[1:]):
+                    a, b = pygame.image.tobytes(before, "RGBA"), pygame.image.tobytes(after, "RGBA")
+                    changed = sum(a[i:i + 4] != b[i:i + 4] for i in range(0, len(a), 4))
+                    self.assertGreater(changed / 4096, 0.04)
+                baby, adult = (pygame.mask.from_surface(frames[index]) for index in (0, 2))
+                overlap = baby.overlap_area(adult, (0, 0))
+                difference = baby.count() + adult.count() - 2 * overlap
+                union = baby.count() + adult.count() - overlap
+                self.assertGreater(difference / union, 0.08)
+
+    def test_final_test_blocks_next_species_until_seven_correct_answers(self):
+        for session in (1, 2):
+            self.app.game["session"] = session
+            for word in WORDS:
+                main.record_answer(self.app.game, word["id"], True)
+        self.app.open_zoo()
+        self.app.settle_current_pet()
+        self.assertEqual(self.app.screen, "final_test")
+        for i, expected in enumerate(self.app.game["zoo"]["exam"]["queue"][:]):
+            self.app.submit_final_test(expected if i < 6 else next(word["id"] for word in WORDS if word["id"] != expected))
+            self.app.draw()
+            self.app.next_final_test()
+        self.app.draw()
+        self.assertEqual(current_species(self.app.game), "sniffer")
+        self.app.pause_final_test()
+        self.app.open_final_test(retry=True)
+        for i, expected in enumerate(self.app.game["zoo"]["exam"]["queue"][:]):
+            self.app.submit_final_test(expected if i < 7 else next(word["id"] for word in WORDS if word["id"] != expected))
+            self.app.next_final_test()
+        self.app.draw()
+        self.app.settle_current_pet()
+        self.assertEqual(current_species(self.app.game), "axolotl")
+        self.assertEqual(self.app.screen, "zoo")
+
+    def test_replay_confirmation_keeps_grown_friend_and_creates_a_new_egg(self):
+        for session in (1, 2):
+            self.app.game["session"] = session
+            for word in WORDS:
+                main.record_answer(self.app.game, word["id"], True)
+        self.certify_pet()
+        self.app.settle_current_pet()
+        self.app.request_replay(0)
+        self.assertEqual(self.app.screen, "replay_confirm")
+        self.app.draw()
+        self.app.start_replay()
+        self.assertTrue(self.app.game["zoo"]["replay"])
+        self.assertEqual(len(self.app.game["zoo"]["residents"]), 1)
+        self.assertEqual(main.growth_stage(self.app.game), 0)
+        with patch.object(self.app.sprites, "scaled_species", wraps=self.app.sprites.scaled_species) as render:
+            self.app.draw()
+            self.assertTrue(any(call.args[:3] == ("sniffer", "growth", 4) for call in render.call_args_list))
+            self.assertTrue(any(call.args[:3] == ("sniffer", "hatching", 0) for call in render.call_args_list))
+        self.app.open_zoo()
+        self.app.draw()
+
+    def test_grammar_cards_and_checks_use_sentence_context_not_an_isolated_translation(self):
+        from grammar import FORM_QUESTIONS
+        for word_id in FORM_QUESTIONS:
+            self.app.queue = [word_id]
+            self.app.word_id = word_id
+            self.app.card_index = 0
+            self.app.screen = "cards"
+            self.app.card_phase = "intro"
+            self.app.draw()
+            self.app.card_phase = "quiz"
+            self.app.options = main.choice_ids(word_id)
+            with patch.object(self.app, "button", wraps=self.app.button) as button, patch("main.text", wraps=main.text) as painted_text:
+                self.app.draw()
+                labels = [call.args[1] for call in button.call_args_list]
+                self.assertIn(word_id, labels)
+                self.assertNotIn(main.WORD_BY_ID[word_id]["ru"], labels)
+                self.assertNotIn(main.WORD_BY_ID[word_id]["ru"], [call.args[1] for call in painted_text.call_args_list])
+            self.app.game["active_review"] = {"milestone": 30, "queue": [word_id], "answers": [], "phase": "quiz"}
+            self.app.review_options = main.choice_ids(word_id)
+            self.app.screen = "review"
+            self.app.draw()
+
+    def test_new_word_distinguishes_pronunciation_and_translation_with_icons_only(self):
+        self.app.start_lesson()
+        with patch("main.word_hint_icon", wraps=main.word_hint_icon) as icon, patch("main.text", wraps=main.text) as painted:
+            self.app.draw()
+            labels = [call.args[1] for call in painted.call_args_list]
+            self.assertNotIn("ПРОИЗНОШЕНИЕ", labels)
+            self.assertNotIn("ПЕРЕВОД", labels)
+            self.assertEqual([call.args[1] for call in icon.call_args_list], ["sound", "book"])
+        icon_surface = pygame.Surface((40, 30), pygame.SRCALPHA)
+        with patch("pygame.font.Font", side_effect=AssertionError("Icons must not use a font")):
+            main.word_hint_icon(icon_surface, "sound", 2, 2, main.RED)
+            main.word_hint_icon(icon_surface, "book", 2, 2, main.TEAL)
+
+    def test_new_word_picture_shows_the_word_not_the_current_pet_or_egg(self):
+        self.app.queue = ["cat"]
+        self.app.word_id = "cat"
+        self.app.screen = "cards"
+        self.app.card_phase = "intro"
+        with patch.object(self.app.sprites, "scaled", wraps=self.app.sprites.scaled) as pet, patch.object(self.app.word_pictures, "draw", wraps=self.app.word_pictures.draw) as picture:
+            self.app.draw()
+            pet.assert_not_called()
+            self.assertEqual(picture.call_args.args[1], "cat")
+
+    def test_dictionary_listening_and_repetition_do_not_change_test_or_growth_state(self):
+        self.set_pet_stage(4)
+        self.app.game["repeat_words"] = ["cat"]
+        self.app.game["zoo"]["exam"] = {"queue": [word["id"] for word in WORDS[:10]],
+                                          "answers": ["cat"] * 10, "phase": "summary"}
+        self.app.screen = "final_test"
+        before = copy.deepcopy(self.app.game)
+        self.app.open_dictionary("sniffer")
+        self.app.draw()
+        visible = learned_vocabulary(self.app.game, "sniffer")
+        self.app.click((900, 283))
+        self.app.speech.speak.assert_called_once_with(visible[0]["id"])
+        self.app.dictionary_reveal = False
+        self.app.draw()
+        self.app.toggle_dictionary_errors()
+        self.app.draw()
+        self.app.search_dictionary()
+        self.app.handle_event(pygame.event.Event(pygame.TEXTINPUT, text="cat"))
+        self.app.draw()
+        self.app.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN))
+        self.app.close_dictionary()
+        self.assertEqual(self.app.screen, "final_test")
+        self.assertEqual(self.app.game, before)
+
+    def test_dictionary_pagination_empty_results_and_search_render_inside_the_canvas(self):
+        self.set_pet_stage(4)
+        self.app.open_dictionary()
+        self.app.dictionary_page = 999
+        self.app.draw()
+        self.assertLess(self.app.dictionary_page, 999)
+        self.app.dictionary_query = "nothing matches this"
+        self.app.draw()
+        self.assertEqual(self.app.dictionary_page, 0)
+        self.assertTrue(all(pygame.Rect(0, 0, main.WIDTH, main.HEIGHT).contains(rect) for rect, _ in self.app.buttons))
+
+    def test_pronoun_example_highlights_the_pronoun_not_another_verb_form(self):
+        with patch("main.text", wraps=main.text) as painted:
+            main.contextual_sentence(self.app.canvas, "I", "am", "happy.", (400, 250), focus="I")
+            self.assertEqual(painted.call_args_list[0].args[4], main.RED)
+            self.assertEqual(painted.call_args_list[1].args[4], main.INK)
 
 
 class SpeechTests(unittest.TestCase):

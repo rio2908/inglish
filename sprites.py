@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pygame
+from creature_sprites import families
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets" / "sniffer"
@@ -33,12 +34,26 @@ class SnifferSprites:
         self.hatching = _split_strip("hatching-grid.png", [0, 390, 770, 1160, 1580, 2172])
         self.walk = _split_strip("walk-grid.png", [0, 370, 720, 1070, 1420, 1770, 2172])
         self.cache = {}
+        self.species = "sniffer"
+        self.families = {"sniffer": {"growth": self.growth, "hatching": self.hatching, "walk": self.walk}}
+
+    def select_species(self, species):
+        if species not in self.families:
+            self.families[species] = families(species)
+        self.species = species
+        for family, frames in self.families[species].items():
+            setattr(self, family, frames)
 
     def scaled(self, family, index, max_width, max_height):
-        key = (family, index, max_width, max_height)
+        return self.scaled_species(self.species, family, index, max_width, max_height)
+
+    def scaled_species(self, species, family, index, max_width, max_height):
+        key = (species, family, index, max_width, max_height)
         if key in self.cache:
             return self.cache[key]
-        source = getattr(self, family)[index]
+        if species not in self.families:
+            self.families[species] = families(species)
+        source = self.families[species][family][index]
         ratio = min(max_width / source.get_width(), max_height / source.get_height())
         size = (max(1, int(source.get_width() * ratio)), max(1, int(source.get_height() * ratio)))
         sprite = pygame.transform.scale(source, size)

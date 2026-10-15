@@ -102,13 +102,13 @@ class GameStorageTests(unittest.TestCase):
 
     def test_growth_countdown_boundaries(self):
         game = new_game()
-        self.assertEqual(growth_remaining(game), ("answers", 5))
+        self.assertEqual(growth_remaining(game), ("hatch_words", 30))
         game["correct_answers"] = 4
-        self.assertEqual(growth_remaining(game), ("answers", 1))
+        self.assertEqual(growth_remaining(game), ("hatch_words", 30))
         game["correct_answers"] = 5
-        for count, expected in ((0, 40), (39, 1), (40, 40), (79, 1), (80, 40), (119, 1), (120, 0), (150, 0)):
+        for count, expected in ((0, 30), (29, 1), (30, 30), (59, 1), (60, 30), (89, 1), (90, 30), (119, 1), (120, 0), (150, 0)):
             game["cards"] = {word["id"]: {"seen": True, "correct_sessions": [1, 2]} for word in WORDS[:count]}
-            kind = "complete" if count >= 120 else "words"
+            kind = "complete" if count >= 120 else "hatch_words" if count < 30 else "words"
             self.assertEqual(growth_remaining(game), (kind, expected))
 
 

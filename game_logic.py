@@ -83,6 +83,16 @@ def normalize_game(raw):
                 "answers": max(0, min(len(queue), lesson.get("answers", 0))) if type(lesson.get("answers")) is int else 0,
             }
     game["zoo"] = normalize_zoo(raw.get("zoo"))
+    histories = [game["cards"], game["zoo"]["pet_cards"]]
+    if game["zoo"]["suspended"]:
+        histories.append(game["zoo"]["suspended"]["zoo"]["pet_cards"])
+    latest_round = max((session for cards in histories for record in cards.values()
+                        for session in record.get("correct_sessions", [])), default=0)
+    if game["session"] < latest_round or (game["lesson"] is not None and game["session"] == 0):
+        # A missing/obsolete counter must not create round 0 or reuse an old ID.
+        # A pending lesson with an invalid counter resumes in a fresh valid round;
+        # already answered result cards are still protected by their saved phase.
+        game["session"] = max(1, latest_round + 1) if game["lesson"] else latest_round
     normalize_progress(game, raw)
     notice = raw.get("growth_notice")
     if (isinstance(notice, dict) and notice.get("species") == current_species(game)
@@ -176,6 +186,10 @@ def mark_seen(game, word_id):
 
 def record_answer(game, word_id, correct):
     """Track global learning and the current pet; return its newly learned word."""
+    if type(game.get("session")) is not int or game["session"] <= 0:
+        raise ValueError("Сначала начни игровой раунд")
+    if not isinstance(word_id, str) or word_id not in WORD_BY_ID:
+        raise ValueError("Неизвестное слово")
     before_stage = growth_stage(game)
     record = record_for(game, word_id)
     record["seen"] = True

@@ -3,12 +3,16 @@
 from pathlib import Path
 import base64
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
 
 import pygame
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Speech:
@@ -21,13 +25,24 @@ class Speech:
         self.locale = None
         self.listener = None
         self.error = ""
+        self.last_error = ""
         self.started = time.monotonic()
         self.process = None
         self.android = sys.platform == "android" or "ANDROID_ARGUMENT" in os.environ
+        self._engine_generation = 0
+        self._utterance_generation = 0
+        self._init_failed = False
+        self._closed = False
         if self.android:
             self._init_android()
 
     def _init_android(self):
+        self._engine_generation += 1
+        generation = self._engine_generation
+        self.started = time.monotonic()
+        self.ready = False
+        self._init_failed = False
+        old_engine, self.tts = self.tts, None
         try:
             from jnius import PythonJavaClass, autoclass, java_method
             from android.runnable import run_on_ui_thread
@@ -40,24 +55,51 @@ class Speech:
 
                 @java_method("(I)V")
                 def onInit(self, status):
+                    if speech._closed or generation != speech._engine_generation:
+                        return
                     speech.ready = status == 0
+                    speech._init_failed = status != 0
                     if status != 0:
-                        speech.error = "Не удалось запустить озвучку Android. Проверьте настройки TTS."
+                        speech._android_error("Не удалось запустить озвучку. Проверь настройки синтеза речи Android.", f"onInit status={status}")
 
-            self.listener = InitListener()
+            listener = InitListener()
+            self.listener = listener
             # SDL runs Python on a worker thread. Create/use TTS on Android's UI thread.
             @run_on_ui_thread
             def initialize():
                 try:
+                    if old_engine is not None:
+                        try:
+                            old_engine.shutdown()
+                        except Exception as shutdown_error:
+                            LOGGER.debug("Android TTS old engine shutdown failed: %s", shutdown_error)
+                    if self._closed or generation != self._engine_generation:
+                        return
                     activity = autoclass("org.kivy.android.PythonActivity").mActivity
-                    self.locale = autoclass("java.util.Locale").US
-                    self.tts = autoclass("android.speech.tts.TextToSpeech")(activity, self.listener)
+                    self.locale = autoclass("java.util.Locale")("en", "US")
+                    engine = autoclass("android.speech.tts.TextToSpeech")(activity, listener)
+                    if self._closed or generation != self._engine_generation:
+                        engine.shutdown()
+                        return
+                    self.tts = engine
                 except Exception as error:
-                    self.error = f"Не удалось включить озвучку Android: {error}"
+                    if self._closed or generation != self._engine_generation:
+                        return
+                    self._init_failed = True
+                    self._android_error("Озвучка Android недоступна. Проверь настройки синтеза речи.", error)
             initialize()
         except Exception as error:
             self.tts = None
-            self.error = f"Не удалось включить озвучку Android: {error}"
+            self._init_failed = True
+            self._android_error("Не удалось включить озвучку Android. Попробуй перезапустить игру.", error)
+
+    def _android_error(self, message, detail):
+        self.error = message
+        self.last_error = f"{type(detail).__name__}: {detail}" if isinstance(detail, Exception) else str(detail)
+        if isinstance(detail, Exception):
+            LOGGER.warning("Android TTS: %s", self.last_error, exc_info=True)
+        else:
+            LOGGER.info("Android TTS: %s", self.last_error)
 
     def tick(self):
         if self.process is not None and self.process.poll() is not None:
@@ -73,33 +115,64 @@ class Speech:
                     platform.window.snifferSpeechError = ""
             except Exception:
                 pass
-        if self.pending and self.android and not self.ready and time.monotonic() - self.started > 15:
+        if self.pending and self.android and self._init_failed:
             self.pending = None
-            self.error = "Озвучка не запустилась. Включите TTS и скачайте английский голос."
+        elif self.pending and self.android and not self.ready and time.monotonic() - self.started > 15:
+            self.pending = None
+            self._init_failed = True
+            self._android_error("Озвучка не запустилась. Проверь настройки синтеза речи Android.", "initialization timeout")
         if self.pending and self.tts and self.ready:
             word = self.pending
             self.pending = None
             self._speak_android(word)
 
     def _speak_android(self, word):
-        from android.runnable import run_on_ui_thread
+        engine = self.tts
+        generation = self._utterance_generation
 
-        @run_on_ui_thread
         def speak():
+            if self._closed or generation != self._utterance_generation or engine is not self.tts or not self.ready:
+                return
             try:
-                if self.tts.setLanguage(self.locale) < 0:
-                    self.error = "Скачайте английский голос в настройках озвучки Android."
+                language_status = engine.setLanguage(self.locale)
+                if language_status < 0:
+                    self.ready = False
+                    self._init_failed = True
+                    self._android_error("Скачайте английский голос в настройках озвучки Android.", f"setLanguage status={language_status}")
                     return
-                self.tts.setSpeechRate(0.82)
-                result = self.tts.speak(word, 0, None, "sniffer-word")
+                from jnius import autoclass, cast
+                java_text = autoclass("java.lang.String")(word)
+                engine.setSpeechRate(0.82)
+                try:
+                    # Avoid ambiguous Python str/None conversion for CharSequence/Bundle.
+                    params = autoclass("android.os.Bundle")()
+                    result = engine.speak(cast("java.lang.CharSequence", java_text), 0, params, "sniffer-word")
+                except Exception as binding_error:
+                    LOGGER.debug("Android TTS modern overload failed: %s", binding_error)
+                    params = autoclass("java.util.HashMap")()
+                    params.put("utteranceId", "sniffer-word")
+                    result = engine.speak(java_text, 0, params)
                 if result < 0:
-                    self.error = "Android не смог произнести слово. Проверьте настройки TTS."
+                    self.ready = False
+                    self._init_failed = True
+                    self._android_error("Не удалось озвучить слово. Проверь настройки синтеза речи Android.", f"speak status={result}")
+                else:
+                    self.last_error = ""
             except Exception as error:
-                self.error = f"Ошибка озвучки Android: {error}"
-        speak()
+                self.ready = False
+                self._init_failed = True
+                self._android_error("Не удалось озвучить слово. Попробуй ещё раз или перезапусти игру.", error)
+        try:
+            from android.runnable import run_on_ui_thread
+            run_on_ui_thread(speak)()
+        except Exception as error:
+            self._android_error("Озвучка Android недоступна. Попробуй перезапустить игру.", error)
 
     def speak(self, word):
         self.error = ""
+        if self._closed:
+            return False
+        self._utterance_generation += 1
         path = self.audio_dir / f"{word}.wav"
         if path.is_file() and pygame.mixer.get_init():
             try:
@@ -110,8 +183,7 @@ class Speech:
             except pygame.error:
                 pass
         if self.android:
-            if not self.tts and time.monotonic() - self.started > 15:
-                self.started = time.monotonic()
+            if self._init_failed or (not self.ready and time.monotonic() - self.started > 15):
                 self._init_android()
             self.pending = word
             self.tick()
@@ -162,6 +234,7 @@ $s.Dispose()
         return False
 
     def stop(self):
+        self._utterance_generation += 1
         self.pending = None
         self.error = ""
         if self.process is not None and self.process.poll() is None:
@@ -169,14 +242,27 @@ $s.Dispose()
         self.process = None
         if self.tts:
             try:
-                self.tts.stop()
+                engine = self.tts
+                if self.android:
+                    from android.runnable import run_on_ui_thread
+                    run_on_ui_thread(engine.stop)()
+                else:
+                    engine.stop()
             except Exception:
                 pass
 
     def shutdown(self):
         self.stop()
-        if self.tts:
+        self._closed = True
+        self.ready = False
+        self._engine_generation += 1
+        engine, self.tts = self.tts, None
+        if engine:
             try:
-                self.tts.shutdown()
+                if self.android:
+                    from android.runnable import run_on_ui_thread
+                    run_on_ui_thread(engine.shutdown)()
+                else:
+                    engine.shutdown()
             except Exception:
                 pass

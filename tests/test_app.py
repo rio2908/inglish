@@ -119,8 +119,18 @@ class AppTests(unittest.TestCase):
         self.app.click((709, 409))
         self.app.speech.speak.assert_called_once_with(self.app.word_id)
 
+    def test_successful_audio_retry_clears_the_previous_error_message(self):
+        self.app.speech.speak = Mock(side_effect=(False, True))
+        self.app.speech.error = "Не удалось озвучить слово"
+        self.app.play_audio("cat")
+        self.assertTrue(self.app.audio_notice)
+        self.app.play_audio("cat")
+        self.assertEqual(self.app.audio_notice, "")
+        self.assertEqual(self.app.audio_notice_until, 0)
+
     def set_pet_stage(self, stage):
         self.app.game = new_game()
+        self.app.game["session"] = 2 if stage else 0
         self.app.game["correct_answers"] = 5 if stage else 0
         self.app.game["care"]["joy"] = 0
         learned = {0: 0, 1: 30, 2: 60, 3: 90, 4: 120}[stage]
@@ -496,6 +506,74 @@ class AppTests(unittest.TestCase):
             self.assertEqual(painted.call_args_list[0].args[4], main.RED)
             self.assertEqual(painted.call_args_list[1].args[4], main.INK)
 
+    def test_next_card_cannot_skip_the_next_question_if_called_twice(self):
+        self.app.start_lesson()
+        self.app.intro_done()
+        self.app.answer(self.app.word_id)
+        self.app.next_card()
+        index, word = self.app.card_index, self.app.word_id
+        self.assertEqual(self.app.card_phase, "intro")
+        self.app.next_card()
+        self.assertEqual(self.app.card_index, index)
+        self.assertEqual(self.app.word_id, word)
+
+    def test_paused_quiz_does_not_accept_an_answer_from_an_old_button(self):
+        self.app.start_lesson()
+        self.app.intro_done()
+        self.app.leave_cards()
+        before = copy.deepcopy(self.app.game)
+        self.app.answer(self.app.word_id)
+        self.assertEqual(self.app.game, before)
+
+    def test_paused_intro_does_not_mark_the_word_seen_from_an_old_button(self):
+        self.app.start_lesson()
+        self.app.leave_cards()
+        before = copy.deepcopy(self.app.game)
+        self.app.intro_done()
+        self.assertEqual(self.app.game, before)
+
+    def test_paused_checks_ignore_old_answer_and_next_callbacks(self):
+        self.set_pet_stage(1)
+        self.app.start_lesson()
+        first = self.app.game["active_review"]["queue"][0]
+        self.app.submit_review(first)
+        self.app.pause_review()
+        before = copy.deepcopy(self.app.game)
+        self.app.submit_review(first)
+        self.app.next_review()
+        self.assertEqual(self.app.game, before)
+
+    def test_save_conflict_does_not_leave_the_old_pet_hitbox_active_over_export(self):
+        self.set_pet_stage(1)
+        self.app.screen = "home"
+        self.app.draw()
+        self.assertTrue(self.app.pet_rect.collidepoint((350, 440)))
+        self.app.save_conflict = True
+        self.app.draw()
+        with patch.object(self.app, "transfer_profile") as transfer:
+            self.app.click((350, 440))
+            transfer.assert_called_once_with(True)
+        self.assertEqual(self.app.hearts.particles, [])
+
+    def test_second_touch_in_the_same_frame_cannot_use_the_previous_next_button(self):
+        self.app.start_lesson()
+        self.app.intro_done()
+        self.app.answer(self.app.word_id)
+        self.app.draw()
+        self.app.click((420, 510))
+        self.assertEqual(self.app.card_index, 1)
+        self.app.click((620, 510))
+        self.assertEqual(self.app.card_index, 1)
+
+    def test_resumed_legacy_quiz_cannot_show_more_learned_words_than_were_saved(self):
+        legacy = new_game()
+        legacy["cards"]["cat"] = {"seen": True, "correct_sessions": [2]}
+        legacy["lesson"] = {"queue": ["cat", "dog"], "index": 0, "phase": "quiz", "mode": "meaning", "correct": False, "answers": 0}
+        self.store.save_game(self.identity, legacy)
+        self.app.enter_player(self.identity)
+        self.app.answer("cat")
+        self.assertEqual(main.mastered_count(self.store.load_game(self.identity)), main.mastered_count(self.app.game))
+
 
 class SpeechTests(unittest.TestCase):
     def test_android_initialization_and_playback_run_on_ui_thread(self):
@@ -517,12 +595,14 @@ class SpeechTests(unittest.TestCase):
 
         classes = {
             "org.kivy.android.PythonActivity": SimpleNamespace(mActivity="activity"),
-            "java.util.Locale": SimpleNamespace(US="en-US"),
+            "java.util.Locale": lambda language, country: language + "-" + country,
+            "java.lang.String": lambda value: ("JavaString", value),
+            "android.os.Bundle": lambda: {"JavaBundle": True},
             "android.speech.tts.TextToSpeech": initialize_tts,
         }
         modules = {
             "jnius": SimpleNamespace(PythonJavaClass=object, autoclass=lambda name: classes[name],
-                                     java_method=lambda signature: lambda function: function),
+                                     cast=lambda name, value: value, java_method=lambda signature: lambda function: function),
             "android.runnable": SimpleNamespace(run_on_ui_thread=ui_thread),
         }
         with patch.dict("sys.modules", modules), patch("speech.sys.platform", "android"):
@@ -531,7 +611,7 @@ class SpeechTests(unittest.TestCase):
             self.assertTrue(speech.speak("hello"))
             self.assertEqual(calls, ["initialize", "speak"])
             tts.setLanguage.assert_called_once_with("en-US")
-            tts.speak.assert_called_once_with("hello", 0, None, "sniffer-word")
+            tts.speak.assert_called_once_with(("JavaString", "hello"), 0, {"JavaBundle": True}, "sniffer-word")
 
     def test_android_missing_english_voice_is_reported(self):
         speech = Speech(Path("missing-audio"))

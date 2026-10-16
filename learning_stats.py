@@ -75,6 +75,13 @@ def normalize_progress(game, raw):
     count = pet_learned_count(game)
     species = current_species(game)
     archived = {resident["species"] for resident in game["zoo"]["residents"]}
+    waiting = game["zoo"].get("suspended")
+    waiting_context = None
+    waiting_count = 0
+    if game["zoo"]["replay"] and waiting:
+        waiting_zoo = waiting["zoo"]
+        waiting_context = (waiting_zoo["active"], waiting_zoo["cycle"])
+        waiting_count = pet_learned_count({"cards": game["cards"], "zoo": waiting_zoo})
     results = raw.get("reviews")
     if isinstance(results, list):
         for result in results:
@@ -83,7 +90,12 @@ def normalize_progress(game, raw):
             milestone, score = result.get("milestone"), result.get("score")
             owner = review_species(result)
             cycle = review_cycle(result)
-            limit = 150 if isinstance(owner, str) and owner in archived else count if owner == species else 0
+            if owner == species and cycle == game["zoo"]["cycle"]:
+                limit = count
+            elif (owner, cycle) == waiting_context:
+                limit = waiting_count
+            else:
+                limit = 150 if isinstance(owner, str) and owner in archived else 0
             if (isinstance(owner, str) and owner in SPECIES_NAMES
                     and type(cycle) is int and 0 <= cycle <= game["zoo"]["serial"]
                     and type(milestone) is int and milestone in MILESTONES and milestone <= limit

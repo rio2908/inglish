@@ -16,7 +16,7 @@ from game_logic import (
 )
 from game_backup import ProfilePicker
 from game_storage import read_player_backup_bytes
-from player_profiles import PlayerStore, player_name
+from player_profiles import PlayerStore, StaleProfileError, player_name
 from creature_sprites import GROWTH_SIZES
 from habitats import Habitats, SHADOW_COLORS, kelp
 from grammar import FORM_QUESTIONS, NOTES
@@ -202,10 +202,14 @@ class GameApp:
         self.players = profile_store if profile_store is not None else PlayerStore()
         self.player_id = None
         self.player_name = ""
+        self.player_revision = None
+        self.save_conflict = False
         self.game = new_game()
         self.sprites.select_species(current_species(self.game))
         self.screen = "home"
         self.buttons = []
+        self.input_ready = False
+        self.button_scope = None
         self.message = "Занимайся словами и помоги питомцу вылупиться!" if not hatch_complete(self.game) else "Питомец ждёт тебя в саду!"
         self.message_until = 0
         self.speech = Speech(AUDIO_DIR)
@@ -279,8 +283,11 @@ class GameApp:
             return
         pygame.key.stop_text_input()
         self.speech.stop()
+        self.input_ready = False
         self.player_id = None
         self.player_name = ""
+        self.player_revision = None
+        self.save_conflict = False
         self.game = new_game()
         self.sprites.select_species("sniffer")
         self.pet_behavior = PetBehavior(0, pygame.time.get_ticks() / 1000)
@@ -318,6 +325,8 @@ class GameApp:
 
     def activate_game(self, game):
         self.speech.stop()
+        self.input_ready = False
+        self.save_conflict = False
         self.game = game
         self.sprites.select_species(current_species(game))
         self.pet_behavior = PetBehavior(growth_stage(game), pygame.time.get_ticks() / 1000)
@@ -363,15 +372,15 @@ class GameApp:
         if self.player_id is not None and self.player_id != identity and not self.persist():
             return
         try:
-            game = self.players.load_game(identity)
-            metadata = self.players.metadata(identity)
+            profile = self.players.load_profile(identity)
             self.players.select_player(identity)
         except Exception as error:
             self.login_notice = str(error)
             return False
         pygame.key.stop_text_input()
-        self.player_id, self.player_name = identity, metadata["name"]
-        self.activate_game(game)
+        self.player_id, self.player_name = identity, profile["name"]
+        self.player_revision = profile["revision"]
+        self.activate_game(profile["game"])
         self.notify(f"Привет, {self.player_name}! Это твой питомец.")
         return True
 
@@ -407,12 +416,28 @@ class GameApp:
                 "correct": self.answer_correct, "answers": self.session_answer_count,
             }
         try:
-            self.players.save_game(self.player_id, self.game)
+            self.player_revision = self.players.save_game(self.player_id, self.game, expected_revision=self.player_revision)
             return True
+        except StaleProfileError as error:
+            self.save_conflict = True
+            self.profile_notice = str(error)
+            self.speech.stop()
+            return False
         except Exception as error:
             self.notify("Не удалось сохранить игру. Выгрузите профиль.", 8)
             self.profile_notice = f"Ошибка сохранения: {error}"
             return False
+
+    def check_profile_freshness(self):
+        if self.player_id is None:
+            return
+        try:
+            if self.players.revision(self.player_id) != self.player_revision:
+                self.save_conflict = True
+                self.profile_notice = "Сохранение обновилось в другом окне. Старые данные не будут записаны поверх него."
+                self.speech.stop()
+        except Exception as error:
+            self.profile_notice = f"Не удалось проверить сохранение: {error}"
 
     def open_profile(self):
         self.name_input = self.game["pet_name"]
@@ -510,16 +535,21 @@ class GameApp:
             self.profile_notice = "Имя сохранено."
 
     def transfer_profile(self, export):
-        self.persist()
         try:
+            if self.profile_picker.busy:
+                raise ValueError("Дождись завершения текущего выбора файла")
+            if not self.persist() and not export:
+                return
             if export and self.player_id is None:
                 raise ValueError("Сначала выбери игрока")
-            metadata = self.players.metadata(self.player_id) if self.player_id else None
-            self.profile_transfer_owner = self.player_id
-            self.profile_transfer_started = True
-            self.profile_picker.start(export, self.game, metadata)
+            # A copy must remain exportable even if the private store cannot be
+            # read/written. Identity was verified on entry and rename.
+            metadata = {"id": self.player_id, "name": self.player_name} if self.player_id else None
+            owner = self.player_id
+            if self.profile_picker.start(export, self.game, metadata):
+                self.profile_transfer_owner = owner
+                self.profile_transfer_started = True
         except Exception as error:
-            self.profile_transfer_started = False
             self.profile_notice = f"Не удалось открыть файл: {error}"
             self.login_notice = self.profile_notice
 
@@ -577,17 +607,17 @@ class GameApp:
         if not self.speech.speak(word_id):
             self.audio_notice = self.speech.error or "Не удалось воспроизвести английскую озвучку"
             self.audio_notice_until = pygame.time.get_ticks() / 1000 + 4
+        else:
+            self.audio_notice = ""
+            self.audio_notice_until = 0
 
     def start_lesson(self):
-        if self.game["growth_notice"]:
-            self.screen = "growth"
-            return
         exam = self.game["zoo"]["exam"]
-        if exam and exam["phase"] in ("quiz", "feedback"):
-            self.final_options = final_choices(self.game)
-            self.screen = "final_test"
+        if (self.game["growth_notice"] or self.game["lesson"] or self.game["active_review"] is not None
+                or (exam and exam["phase"] in ("quiz", "feedback"))):
+            self.restore_lesson()
             return
-        if self.game["active_review"] is not None or pending_review(self.game) is not None:
+        if pending_review(self.game) is not None:
             self.open_review()
             return
         self.queue = start_session(self.game)
@@ -624,13 +654,15 @@ class GameApp:
             self.play_audio(self.word_id)
 
     def intro_done(self):
+        if self.screen != "cards" or self.card_phase != "intro" or self.word_id is None:
+            return
         mark_seen(self.game, self.word_id)
         self.card_phase = "quiz"
         self.persist()
         self.play_audio(self.word_id)
 
     def answer(self, chosen_id):
-        if self.card_phase != "quiz":
+        if self.screen != "cards" or self.card_phase != "quiz" or self.word_id is None:
             return
         self.answer_correct = chosen_id == self.word_id
         self.session_answer_count += 1
@@ -647,6 +679,8 @@ class GameApp:
             self.screen = "growth"
 
     def next_card(self):
+        if self.screen != "cards" or self.card_phase != "result":
+            return
         if self.game["growth_notice"]:
             self.screen = "growth"
             return
@@ -670,18 +704,23 @@ class GameApp:
         self.persist()
 
     def submit_review(self, chosen_id):
+        if self.screen != "review":
+            return
         if answer_review(self.game, chosen_id):
             self.persist()
 
     def next_review(self):
+        if self.screen != "review" or self.game["active_review"] is None or self.game["active_review"]["phase"] != "feedback":
+            return
         advance_review(self.game)
         self.review_options = review_choices(self.game)
         self.persist()
 
     def close_review(self):
         review = self.game["active_review"]
-        if review is not None and review["phase"] == "summary":
-            self.game["active_review"] = None
+        if self.screen != "review" or review is None or review["phase"] != "summary":
+            return
+        self.game["active_review"] = None
         self.screen = "home"
         self.restore_lesson()
         self.persist()
@@ -730,10 +769,14 @@ class GameApp:
         self.persist()
 
     def submit_final_test(self, chosen):
+        if self.screen != "final_test":
+            return
         if answer_final_test(self.game, chosen):
             self.persist()
 
     def next_final_test(self):
+        if self.screen != "final_test" or self.game["zoo"]["exam"] is None or self.game["zoo"]["exam"]["phase"] != "feedback":
+            return
         advance_final_test(self.game)
         self.final_options = final_choices(self.game)
         self.persist()
@@ -803,7 +846,7 @@ class GameApp:
         text(self.canvas, "EnglishCraft", 40, (170, 26 if self.player_id else 33), CREAM, True)
         if self.player_id:
             text(self.canvas, "Игрок: " + self.player_name, 18, (170, 55), GOLD, max_width=305)
-        if self.screen == "home":
+        if self.screen == "home" and not self.save_conflict:
             self.button((345, 10, 175, 43), "ЗООПАРК", self.open_zoo, fill=(119, 138, 65), size=26)
             self.button((535, 10, 220, 43), "СТАТИСТИКА", self.open_statistics, fill=(88, 129, 155), size=25)
             self.button((770, 10, 195, 43), "ПРОФИЛЬ", self.open_profile, fill=TEAL, size=27)
@@ -939,8 +982,10 @@ class GameApp:
             self.button((701, 345, 238, 45), GAME_NAMES[stage], self.start_play, fill=(84, 129, 168), size=23)
             self.button((701, 402, 238, 45), "Убрать", self.do_clean, enabled=self.game["poop"], fill=(100, 117, 79), size=26)
         milestone = pending_review(self.game)
-        label = "ПРОДОЛЖИТЬ ТЕСТ" if self.game["active_review"] else f"ПРОВЕРКА: {milestone} СЛОВ" if milestone else "УЧИТЬ СЛОВА"
-        self.button((35, 506, 365, 63), label, self.start_lesson, fill=TEAL, size=29 if milestone or self.game["active_review"] else 36)
+        exam = self.game["zoo"]["exam"]
+        testing = self.game["active_review"] is not None or (exam and exam["phase"] in ("quiz", "feedback"))
+        label = "ПРОДОЛЖИТЬ ТЕСТ" if testing else "ПРОДОЛЖИТЬ УРОК" if self.game["lesson"] else f"ПРОВЕРКА: {milestone} СЛОВ" if milestone else "УЧИТЬ СЛОВА"
+        self.button((35, 506, 365, 63), label, self.start_lesson, fill=TEAL, size=36 if label == "УЧИТЬ СЛОВА" else 29)
         available = self.game["garden_plants"] < min(10, mastered_count(self.game) // 15)
         self.button((420, 506, 232, 63), "ИСКАТЬ СЕМЕНА", self.do_explore, enabled=can_explore(self.game), fill=(119, 138, 65), size=27)
         if available and not can_explore(self.game):
@@ -1049,12 +1094,10 @@ class GameApp:
             text(self.canvas, self.audio_notice, 21, (500, 585), INK)
 
     def leave_cards(self):
-        if self.session_answer_count:
-            finish_session(self.game)
+        saved = self.persist()
         self.screen = "home"
-        self.game["lesson"] = None
-        self.persist()
-        self.notify("Можно продолжить слова в любой момент.")
+        if saved:
+            self.notify("Урок на паузе. Можно продолжить с этой же карточки.")
 
     def draw_feed(self):
         self.draw_background()
@@ -1305,6 +1348,19 @@ class GameApp:
         text(self.canvas, self.login_notice[:95], 22, (500, 410), RED)
         self.button((210, 466, 280, 53), "СОЗДАТЬ ИГРОКА", self.submit_registration, enabled=bool(player_name(self.registration_input)), size=26)
         self.button((530, 466, 260, 53), "НАЗАД", self.open_login, fill=(124, 111, 89), size=27)
+
+    def draw_save_conflict(self):
+        self.draw_background("sniffer")
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(70, 105, 860, 440))
+        text(self.canvas, "ПРОФИЛЬ ИЗМЕНЁН В ДРУГОМ ОКНЕ", 35, (500, 163), TEAL, True, max_width=800)
+        text(self.canvas, "Чтобы не откатить свежий прогресс, запись остановлена.", 27, (500, 235), INK)
+        text(self.canvas, "Можешь выгрузить копию того, что сделано в этом окне.", 26, (500, 285), INK)
+        text(self.canvas, "Затем загрузи свежую версию профиля из хранилища.", 26, (500, 330), INK)
+        text(self.canvas, "Неперенесённые изменения этого окна будут заменены.", 24, (500, 365), RED)
+        self.button((125, 420, 350, 60), "ВЫГРУЗИТЬ МОЮ КОПИЮ", lambda: self.transfer_profile(True), size=24)
+        self.button((525, 420, 350, 60), "ЗАГРУЗИТЬ СВЕЖЕЕ", lambda: self.enter_player(self.player_id), size=26)
+        text(self.canvas, self.profile_notice[:100], 21, (500, 514), INK, max_width=800)
 
     def draw_growth(self):
         notice = self.game["growth_notice"]
@@ -1650,7 +1706,9 @@ class GameApp:
         self.buttons = []
         if self.player_id is None and self.screen not in ("login", "register", "import", "help"):
             self.screen = "login"
-        if self.screen == "login":
+        if self.save_conflict:
+            self.draw_save_conflict()
+        elif self.screen == "login":
             self.draw_login()
         elif self.screen == "register":
             self.draw_registration()
@@ -1695,8 +1753,12 @@ class GameApp:
         self.display.fill(INK)
         self.display.blit(pygame.transform.scale(self.canvas, view_size), self.viewport)
         pygame.display.flip()
+        self.button_scope = (self.screen, self.player_id, self.save_conflict)
+        self.input_ready = True
 
     def click(self, screen_pos):
+        if not self.input_ready or self.button_scope != (self.screen, self.player_id, self.save_conflict):
+            return
         now_ms = pygame.time.get_ticks()
         if now_ms - self.last_pointer_ms < 120 and math.dist(screen_pos, self.last_pointer_pos) < 24:
             return
@@ -1707,27 +1769,34 @@ class GameApp:
         x = (screen_pos[0] - self.viewport.left) * WIDTH / self.viewport.width
         y = (screen_pos[1] - self.viewport.top) * HEIGHT / self.viewport.height
         point = (int(x), int(y))
-        if self.screen == "home":
+        if self.screen == "home" and not self.save_conflict:
             if self.poop_rect and self.poop_rect.collidepoint(point):
+                self.input_ready = False
                 self.do_clean()
                 return
             if self.pet_rect.collidepoint(point) and hatch_complete(self.game):
+                self.input_ready = False
                 self.pet_behavior.pet()
                 self.hearts.emit(self.pet_rect.centerx, self.pet_rect.top + 35, pygame.time.get_ticks() / 1000)
                 self.notify("Питомцу нравится твоё внимание!")
                 return
         for rect, action in reversed(self.buttons):
             if rect.collidepoint(point):
+                self.input_ready = False
                 action()
                 return
 
     def handle_event(self, event):
+        if self.save_conflict and event.type == pygame.KEYDOWN:
+            return
         if event.type == pygame.QUIT:
             self.persist()
             self.running = False
         elif event.type in tuple(getattr(pygame, name, -1) for name in
                                  ("APP_WILLENTERBACKGROUND", "APP_DIDENTERBACKGROUND", "WINDOWFOCUSLOST")):
             self.persist()
+        elif event.type in tuple(getattr(pygame, name, -1) for name in ("APP_DIDENTERFOREGROUND", "WINDOWFOCUSGAINED")):
+            self.check_profile_freshness()
         elif event.type == pygame.TEXTINPUT and self.screen == "register":
             self.registration_input = "".join(c for c in (self.registration_input + event.text) if c.isprintable())[:20]
         elif event.type == pygame.KEYDOWN and self.screen == "register":

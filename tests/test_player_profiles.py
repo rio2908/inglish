@@ -5,12 +5,64 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from game_logic import new_game
+from game_logic import mastered_count, new_game, record_answer
+from words import WORDS
 from game_storage import (WEB_STORAGE_KEY, make_backup_bytes, read_player_backup_bytes, write_game)
 from player_profiles import PlayerStore
 
 
 class PlayerProfileTests(unittest.TestCase):
+    def test_stale_window_cannot_roll_back_eight_learned_words_to_four(self):
+        initial = new_game()
+        for session in (1, 2):
+            initial["session"] = session
+            for word in WORDS[:4]:
+                record_answer(initial, word["id"], True)
+        identity = self.store.create_player("Анна", initial)
+        stale_store, fresh_store = PlayerStore(self.path), PlayerStore(self.path)
+        stale_game = stale_store.load_game(identity)
+        current_game = fresh_store.load_game(identity)
+        self.assertEqual(mastered_count(stale_game), 4)
+        for session in (3, 4):
+            current_game["session"] = session
+            for word in WORDS[4:8]:
+                record_answer(current_game, word["id"], True)
+        fresh_store.save_game(identity, current_game)
+        self.assertEqual(mastered_count(self.store.load_game(identity)), 8)
+        conflict = None
+        try:
+            stale_store.save_game(identity, stale_game)
+        except ValueError as error:
+            conflict = error
+        self.assertEqual(mastered_count(self.store.load_game(identity)), 8)
+        self.assertIsNotNone(conflict)
+
+    def test_v1_player_document_is_migrated_to_revision_protected_v2_without_losing_ids(self):
+        game = new_game()
+        game["pet_name"] = "Листик"
+        self.path.write_text(json.dumps({"format": "englishcraft-players", "version": 1, "last_player": "stable-id",
+                                         "profiles": {"stable-id": {"name": "Анна", "game": game}}}, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(self.store.load_game("stable-id"), game)
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(document["last_player"], "stable-id")
+        self.assertEqual(document["profiles"]["stable-id"]["revision"], 0)
+        self.assertEqual(self.store.metadata("stable-id")["name"], "Анна")
+
+    def test_explicit_confirmed_import_can_restore_an_older_copy_but_invalidates_old_writers(self):
+        identity = self.store.create_player("Анна")
+        old = self.store.load_game(identity)
+        current = self.store.load_game(identity)
+        current["correct_answers"] = 12
+        self.store.save_game(identity, current)
+        other = PlayerStore(self.path)
+        stale = other.load_game(identity)
+        backup = {"player": self.store.metadata(identity), "game": old}
+        self.store.restore_backup(backup, identity)
+        self.assertEqual(self.store.load_game(identity), old)
+        with self.assertRaises(ValueError):
+            other.save_game(identity, stale)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.path = Path(self.directory.name) / "players.json"

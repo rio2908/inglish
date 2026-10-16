@@ -1,4 +1,6 @@
 import unittest
+import random
+import copy
 
 from game_logic import (
     can_explore, clean, egg_frame, explore, feed, finish_session,
@@ -9,6 +11,55 @@ from words import WORDS
 
 
 class GameLogicTests(unittest.TestCase):
+    def test_answer_without_a_started_round_is_rejected_without_mutating_progress(self):
+        game = new_game()
+        before = copy.deepcopy(game)
+        with self.assertRaises(ValueError):
+            record_answer(game, "cat", True)
+        self.assertEqual(game, before)
+
+    def test_resumed_legacy_lesson_recovers_a_valid_non_reused_round_number(self):
+        raw = new_game()
+        raw["cards"]["cat"] = {"seen": True, "correct_sessions": [2]}
+        raw["lesson"] = {"queue": ["cat", "dog"], "index": 0, "phase": "quiz", "mode": "meaning", "correct": False, "answers": 0}
+        game = normalize_game(raw)
+        self.assertGreater(game["session"], 2)
+        record_answer(game, "cat", True)
+        restored = normalize_game(game)
+        self.assertEqual(mastered_count(restored), mastered_count(game))
+        self.assertEqual(restored["cards"]["cat"]["correct_sessions"], game["cards"]["cat"]["correct_sessions"])
+
+    def test_recovered_round_counter_is_idempotent_and_handles_old_completed_rounds(self):
+        raw = new_game()
+        raw["cards"]["cat"] = {"seen": True, "correct_sessions": [4, 7]}
+        recovered = normalize_game(raw)
+        self.assertEqual(recovered["session"], 7)
+        self.assertEqual(normalize_game(recovered), recovered)
+        self.assertIn(start_session(recovered, random.Random(1))[-1], {word["id"] for word in WORDS})
+        self.assertEqual(recovered["session"], 8)
+
+    def test_unknown_word_is_rejected_before_it_changes_attempts_or_cards(self):
+        game = new_game()
+        start_session(game)
+        before = copy.deepcopy(game)
+        with self.assertRaises(ValueError):
+            record_answer(game, "not-a-vocabulary-id", True)
+        self.assertEqual(game, before)
+
+    def test_learned_count_never_decreases_during_normal_play_or_backup_round_trips(self):
+        from game_storage import make_backup_bytes, read_backup_bytes
+        game = new_game()
+        rng = random.Random(21)
+        previous = 0
+        for _ in range(20):
+            for word_id in start_session(game, rng):
+                record_answer(game, word_id, rng.random() > 0.25)
+                current = mastered_count(game)
+                self.assertGreaterEqual(current, previous)
+                previous = current
+            game = read_backup_bytes(make_backup_bytes(game))
+            self.assertEqual(mastered_count(game), previous)
+
     def test_word_bank_has_ten_chapters_of_fifteen_distinct_words(self):
         self.assertEqual(len(WORDS), 150)
         self.assertEqual(len({word["id"] for word in WORDS}), 150)

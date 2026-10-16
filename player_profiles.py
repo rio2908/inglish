@@ -7,6 +7,10 @@ from game_logic import new_game, normalize_game
 from game_storage import PLAYERS_FORMAT, read_save_document, write_save_document
 
 
+class StaleProfileError(ValueError):
+    """The caller is trying to save an older in-memory copy of this player."""
+
+
 def player_name(value):
     return " ".join("".join(c for c in value if c.isprintable()).split())[:20] if isinstance(value, str) else ""
 
@@ -14,6 +18,7 @@ def player_name(value):
 class PlayerStore:
     def __init__(self, path=None):
         self.path = path
+        self._revisions = {}
 
     def _write(self, document):
         write_save_document(document, self.path)
@@ -21,27 +26,34 @@ class PlayerStore:
     def _read(self):
         raw = read_save_document(self.path)
         if raw is None:
-            return {"format": PLAYERS_FORMAT, "version": 1, "last_player": None, "profiles": {}}
+            return {"format": PLAYERS_FORMAT, "version": 2, "last_player": None, "profiles": {}}
         if not isinstance(raw, dict):
             raise ValueError("Файл игроков повреждён; прежние данные не перезаписаны")
         if raw.get("format") != PLAYERS_FORMAT:
             if not any(key in raw for key in ("cards", "correct_answers", "session", "pet_name", "zoo")):
                 raise ValueError("Неизвестный формат сохранения; данные не перезаписаны")
             identity = uuid.uuid4().hex
-            raw = {"format": PLAYERS_FORMAT, "version": 1, "last_player": identity,
-                   "profiles": {identity: {"name": "Сохранённая игра", "game": normalize_game(raw)}}}
+            raw = {"format": PLAYERS_FORMAT, "version": 2, "last_player": identity,
+                   "profiles": {identity: {"name": "Сохранённая игра", "game": normalize_game(raw), "revision": 0}}}
             self._write(raw)
-        if raw.get("version") != 1 or not isinstance(raw.get("profiles"), dict):
+        if type(raw.get("version")) is not int or raw["version"] not in (1, 2) or not isinstance(raw.get("profiles"), dict):
             raise ValueError("Версия файла игроков не поддерживается")
         names = set()
         for identity, record in raw["profiles"].items():
             if (not isinstance(identity, str) or not identity or len(identity) > 64 or not isinstance(record, dict)
-                    or not player_name(record.get("name")) or not isinstance(record.get("game"), dict)):
+                    or not player_name(record.get("name")) or not isinstance(record.get("game"), dict)
+                    or type(record.get("revision", 0)) is not int or record.get("revision", 0) < 0):
                 raise ValueError("Профиль игрока повреждён; данные не перезаписаны")
             name = player_name(record["name"]).casefold()
             if name in names:
                 raise ValueError("В сохранении повторяются имена игроков")
             names.add(name)
+        if raw["version"] == 1:
+            raw["version"] = 2
+            for record in raw["profiles"].values():
+                record.setdefault("revision", 0)
+            # Old clients reject v2 instead of silently overwriting newer games.
+            self._write(raw)
         return raw
 
     def list_players(self):
@@ -65,25 +77,44 @@ class PlayerStore:
         identity = identity or uuid.uuid4().hex
         if identity in document["profiles"]:
             raise ValueError("Этот игрок уже есть")
-        document["profiles"][identity] = {"name": name, "game": normalize_game(game) if game is not None else new_game()}
+        document["profiles"][identity] = {"name": name, "game": normalize_game(game) if game is not None else new_game(), "revision": 0}
         document["last_player"] = identity
         self._write(document)
+        self._revisions[identity] = 0
         return identity
 
     def metadata(self, identity):
         record = self._read()["profiles"][identity]
         return {"id": identity, "name": player_name(record["name"])}
 
-    def load_game(self, identity):
-        return normalize_game(copy.deepcopy(self._read()["profiles"][identity]["game"]))
+    def revision(self, identity):
+        return self._read()["profiles"][identity].get("revision", 0)
 
-    def save_game(self, identity, game):
+    def load_game(self, identity):
+        return self.load_profile(identity)["game"]
+
+    def load_profile(self, identity):
+        record = self._read()["profiles"][identity]
+        revision = record.get("revision", 0)
+        self._revisions[identity] = revision
+        return {"id": identity, "name": player_name(record["name"]), "revision": revision,
+                "game": normalize_game(copy.deepcopy(record["game"]))}
+
+    def save_game(self, identity, game, *, expected_revision=None, replace=False):
         document = self._read()
         if identity not in document["profiles"]:
             raise ValueError("Игрок не найден; выбери профиль заново")
+        record = document["profiles"][identity]
+        current = record.get("revision", 0)
+        expected = self._revisions.get(identity) if expected_revision is None else expected_revision
+        if not replace and expected != current:
+            raise StaleProfileError("Профиль изменён в другом окне. Старый прогресс не перезаписал свежий.")
         document["profiles"][identity]["game"] = normalize_game(game)
+        record["revision"] = current + 1
         document["last_player"] = identity
         self._write(document)
+        self._revisions[identity] = current + 1
+        return current + 1
 
     def select_player(self, identity):
         document = self._read()
@@ -123,7 +154,7 @@ class PlayerStore:
     def restore_backup(self, backup, current_id=None):
         mode, target = self.import_target(backup, current_id)
         if mode == "replace":
-            self.save_game(target, backup["game"])
+            self.save_game(target, backup["game"], replace=True)
             return target
         if mode == "create":
             return self.create_player(target, backup["game"], backup["player"]["id"])

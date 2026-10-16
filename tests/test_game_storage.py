@@ -62,6 +62,7 @@ class GameStorageTests(unittest.TestCase):
         game["pet_name"] = "Пушок"
         game["correct_answers"] = 6
         game["cards"]["dog"] = {"seen": True, "correct_sessions": [1, 2]}
+        game["session"] = 2
         game["learned_order"] = ["dog"]
         backup = game_storage.make_backup_bytes(game)
         with tempfile.TemporaryDirectory() as directory:

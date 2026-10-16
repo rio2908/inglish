@@ -9,6 +9,8 @@ from learning_stats import (
     review_choices, review_score, start_review, statistics, word_status,
 )
 from words import WORDS
+from words import words_for_species
+from zoo import begin_replay
 
 
 def learned_game(count):
@@ -31,6 +33,25 @@ def complete_review(game, correct=6):
 
 
 class LearningStatsTests(unittest.TestCase):
+    def test_suspended_pets_completed_checks_survive_saving_during_replay(self):
+        game = learned_game(150)
+        game["zoo"]["residents"] = [{"species": "sniffer", "name": "Сниффер"}]
+        game["zoo"]["active"] = "axolotl"
+        for _ in range(2):
+            game["session"] += 1
+            for word in words_for_species("axolotl")[:40]:
+                record_answer(game, word["id"], True)
+        review = start_review(game, random.Random(2))
+        for word_id in review["queue"][:]:
+            answer_review(game, word_id)
+            advance_review(game)
+        game["active_review"] = None
+        game["growth_notice"] = None
+        self.assertEqual(game["reviews"], [{"milestone": 30, "score": 6, "total": 6, "species": "axolotl"}])
+        self.assertTrue(begin_replay(game, 0))
+        restored = read_backup_bytes(make_backup_bytes(game))
+        self.assertEqual(restored["reviews"], game["reviews"])
+
     def test_only_mastered_words_unlock_reviews(self):
         game = new_game()
         game["session"] = 1

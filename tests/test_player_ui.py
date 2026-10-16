@@ -14,10 +14,125 @@ except ImportError:
 from game_logic import new_game
 from player_profiles import PlayerStore
 from words import WORDS
+from game_storage import make_backup_bytes, read_player_backup_bytes
 import main
 
 
 class PlayerUITests(unittest.TestCase):
+    def test_paused_lesson_is_in_the_export_and_resumes_instead_of_starting_a_new_round(self):
+        self.register("Анна")
+        self.app.start_lesson()
+        self.app.intro_done()
+        self.app.answer(self.app.word_id)
+        expected_queue = self.app.queue[:]
+        expected_session = self.app.game["session"]
+        expected_word = self.app.word_id
+        expected_care = self.app.game["care"].copy()
+        self.app.leave_cards()
+        self.app.open_profile()
+        copied = read_player_backup_bytes(make_backup_bytes(self.app.game, self.store.metadata(self.app.player_id)))
+        self.assertIsNotNone(copied["game"]["lesson"])
+        self.assertEqual(copied["game"]["lesson"]["queue"], expected_queue)
+        self.assertEqual(copied["game"]["lesson"]["phase"], "result")
+        self.app.screen = "home"
+        self.app.start_lesson()
+        self.assertEqual(self.app.game["session"], expected_session)
+        self.assertEqual(self.app.word_id, expected_word)
+        self.assertEqual(self.app.card_phase, "result")
+        self.assertEqual(self.app.game["care"], expected_care)
+
+    def test_second_picker_request_does_not_reassign_the_owner_of_a_busy_transfer(self):
+        anna = self.register("Анна")
+        boris = self.store.create_player("Борис")
+        self.app.profile_picker.pending = True
+        self.app.profile_transfer_started = True
+        self.app.profile_transfer_owner = anna
+        self.app.open_login()
+        self.app.enter_player(boris)
+        self.app.transfer_profile(False)
+        self.assertTrue(self.app.profile_transfer_started)
+        self.assertEqual(self.app.profile_transfer_owner, anna)
+
+    def test_pausing_a_hatched_pets_round_does_not_decrease_needs_or_count_as_a_new_round(self):
+        self.register("Анна")
+        self.app.game["session"] = 2
+        self.app.game["correct_answers"] = 60
+        self.app.game["cards"] = {word["id"]: {"seen": True, "correct_sessions": [1, 2]} for word in WORDS[:30]}
+        self.app.game["reviews"] = [{"milestone": 30, "score": 6, "total": 6}]
+        self.app.start_lesson()
+        self.app.intro_done()
+        self.app.answer(self.app.word_id)
+        session = self.app.game["session"]
+        answers = self.app.game["correct_answers"]
+        care = self.app.game["care"].copy()
+        self.app.leave_cards()
+        self.app.start_lesson()
+        self.assertEqual(self.app.game["session"], session)
+        self.assertEqual(self.app.game["care"], care)
+        self.assertEqual(self.app.card_phase, "result")
+        self.app.answer(self.app.word_id)
+        self.assertEqual(self.app.game["correct_answers"], answers)
+        self.app.next_card()
+        while self.app.screen == "cards":
+            if self.app.card_phase == "intro":
+                self.app.intro_done()
+            elif self.app.card_phase == "quiz":
+                self.app.answer(self.app.word_id)
+            else:
+                self.app.next_card()
+        self.assertIsNone(self.app.game["lesson"])
+        self.assertEqual(self.app.game["care"]["food"], care["food"] - 1)
+        self.assertEqual(self.app.game["care"]["joy"], care["joy"] - 1)
+
+    def test_stale_autosave_does_not_erase_newer_progress_and_can_reload_it(self):
+        identity = self.register("Анна")
+        for session in (1, 2):
+            self.app.game["session"] = session
+            for word in WORDS[:4]:
+                main.record_answer(self.app.game, word["id"], True)
+        self.app.persist()
+        other_store = PlayerStore(self.path)
+        updated = other_store.load_game(identity)
+        for session in (3, 4):
+            updated["session"] = session
+            for word in WORDS[4:8]:
+                main.record_answer(updated, word["id"], True)
+        other_store.save_game(identity, updated)
+        self.app.handle_event(pygame.event.Event(pygame.WINDOWFOCUSGAINED))
+        self.assertTrue(self.app.save_conflict)
+        self.assertFalse(self.app.persist())
+        self.assertTrue(self.app.save_conflict)
+        with patch.object(self.app, "button", wraps=self.app.button) as buttons:
+            self.app.draw()
+            self.assertEqual([call.args[1] for call in buttons.call_args_list], ["ВЫГРУЗИТЬ МОЮ КОПИЮ", "ЗАГРУЗИТЬ СВЕЖЕЕ"])
+        self.assertEqual(main.mastered_count(self.store.load_game(identity)), 8)
+        self.app.enter_player(identity)
+        self.assertFalse(self.app.save_conflict)
+        self.assertEqual(main.mastered_count(self.app.game), 8)
+
+    def test_two_app_instances_using_the_same_store_keep_independent_revision_tokens(self):
+        identity = self.register("Анна")
+        other = main.GameApp(profile_store=self.store)
+        try:
+            other.enter_player(identity)
+            other.game["correct_answers"] = 18
+            self.assertTrue(other.persist())
+            self.assertFalse(self.app.persist())
+            self.assertEqual(self.store.load_game(identity)["correct_answers"], 18)
+        finally:
+            other.speech.shutdown()
+
+    def test_in_memory_profile_can_still_be_exported_if_private_storage_is_unreadable(self):
+        identity = self.register("Анна")
+        self.app.game["pet_name"] = "Листик"
+        self.path.write_text("broken JSON", encoding="utf-8")
+        with patch.object(self.app.profile_picker, "start", return_value=True) as start:
+            self.app.transfer_profile(True)
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[1]["pet_name"], "Листик")
+        self.assertEqual(start.call_args.args[2], {"id": identity, "name": "Анна"})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "broken JSON")
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.path = Path(self.directory.name) / "players.json"

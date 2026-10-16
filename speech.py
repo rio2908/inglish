@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import weakref
 
 import pygame
 
@@ -47,7 +48,7 @@ class Speech:
             from jnius import PythonJavaClass, autoclass, java_method
             from android.runnable import run_on_ui_thread
 
-            speech = self
+            speech_ref = weakref.ref(self)
 
             class InitListener(PythonJavaClass):
                 __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
@@ -55,7 +56,8 @@ class Speech:
 
                 @java_method("(I)V")
                 def onInit(self, status):
-                    if speech._closed or generation != speech._engine_generation:
+                    speech = speech_ref()
+                    if speech is None or speech._closed or generation != speech._engine_generation:
                         return
                     speech.ready = status == 0
                     speech._init_failed = status != 0
@@ -257,6 +259,11 @@ $s.Dispose()
         self.ready = False
         self._engine_generation += 1
         engine, self.tts = self.tts, None
+        self.listener = None
+        self.locale = None
+        for sound in self.cache.values():
+            sound.stop()
+        self.cache.clear()
         if engine:
             try:
                 if self.android:

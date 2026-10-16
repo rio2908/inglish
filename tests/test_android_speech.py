@@ -1,4 +1,6 @@
 import os
+import gc
+import weakref
 from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +48,28 @@ def java_modules(engine, run_on_ui_thread=lambda function: function):
 
 
 class AndroidSpeechTests(unittest.TestCase):
+    def test_native_listener_does_not_keep_shutdown_speech_alive(self):
+        engine = Mock()
+        with patch.dict("sys.modules", java_modules(engine)), patch("speech.sys.platform", "android"):
+            speech = Speech(Path("no-recordings"))
+            listener = speech.listener  # Simulate a listener still owned by Java.
+            reference = weakref.ref(speech)
+            speech.shutdown()
+            del speech
+            gc.collect()
+            self.assertIsNone(reference())
+            listener.onInit(0)
+
+    def test_shutdown_releases_cached_audio(self):
+        speech = Speech(Path("no-recordings"))
+        sound = Mock()
+        reference = weakref.ref(sound)
+        speech.cache["cat"] = sound
+        del sound
+        speech.shutdown()
+        gc.collect()
+        self.assertIsNone(reference())
+
     def create_ready(self, engine):
         speech = Speech(Path("no-recordings"))
         speech.android = True

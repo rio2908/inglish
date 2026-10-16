@@ -17,6 +17,7 @@ class ProfilePicker:
         self.pending = None
         self.result = None
         self._bound = False
+        self._activity = None
         self.web_pending = False
         self.decoder = decoder
         self.request_code = None
@@ -43,6 +44,7 @@ class ProfilePicker:
             if not self._bound:
                 activity.bind(on_activity_result=self._on_activity_result)
                 self._bound = True
+                self._activity = activity
             intent = Intent(Intent.ACTION_CREATE_DOCUMENT if export else Intent.ACTION_OPEN_DOCUMENT)
             intent.setType("application/json")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
@@ -166,3 +168,12 @@ class ProfilePicker:
             return "Профиль прочитан.", self.decoder(content)
         except Exception as error:
             return f"Ошибка профиля: {error}", None
+
+    def close(self):
+        """Release the Activity's reference and any unfinished transfer payload."""
+        if self._bound:
+            self._activity.unbind(on_activity_result=self._on_activity_result)
+            self._bound = False
+            self._activity = None
+        self.pending = self.result = self.request_code = None
+        self.web_pending = False

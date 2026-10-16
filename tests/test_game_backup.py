@@ -12,6 +12,18 @@ from game_storage import make_backup_bytes, read_player_backup_bytes
 
 
 class ProfilePickerTests(unittest.TestCase):
+    def test_close_unbinds_android_callback_and_releases_pending_payload(self):
+        picker = ProfilePicker()
+        activity, current, intent_class = Mock(), Mock(), Mock()
+        with patch("game_backup.sys.platform", "android"), patch.object(picker, "_android", return_value=(activity, current, intent_class)):
+            picker.start(True, new_game())
+            picker.close()
+            picker.close()
+        activity.unbind.assert_called_once_with(on_activity_result=picker._on_activity_result)
+        self.assertFalse(picker.busy)
+        picker._on_activity_result(EXPORT_REQUEST, -1, Mock())
+        self.assertIsNone(picker.result)
+
     def test_android_export_replaces_a_longer_existing_document_without_a_json_tail(self):
         picker = ProfilePicker(decoder=read_player_backup_bytes)
         activity, current, intent_class = Mock(), Mock(), Mock()

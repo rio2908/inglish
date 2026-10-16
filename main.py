@@ -1872,8 +1872,13 @@ async def main():
             app.clock.tick(30)
     finally:
         app.persist()
-        app.speech.shutdown()
-        pygame.quit()
+        try:
+            app.profile_picker.close()
+        finally:
+            try:
+                app.speech.shutdown()
+            finally:
+                pygame.quit()
 
 
 if __name__ == "__main__":

@@ -21,10 +21,73 @@ from player_profiles import PlayerStore
 from zoo import SPECIES, advance_final_test, answer_final_test, current_species, pet_learned_count, start_final_test
 from vocabulary import learned_vocabulary
 import copy
+from learning_fixtures import clear_checkpoints
+from assessments import expected_word
 
 
 class AppTests(unittest.TestCase):
+    def test_exit_saves_paused_lesson_and_requires_confirmation(self):
+        self.app.start_lesson()
+        self.app.intro_done()
+        expected = self.app.word_id
+        self.app.request_exit()
+        self.assertTrue(self.app.running)
+        self.assertEqual(self.app.screen, "exit_confirm")
+        self.app.draw()
+        self.app.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE))
+        self.assertEqual(self.app.screen, "cards")
+        self.app.request_exit()
+        self.app.confirm_exit()
+        self.assertFalse(self.app.running)
+        self.assertEqual(self.store.load_game(self.identity)["lesson"]["phase"], "quiz")
+        self.assertEqual(self.store.load_game(self.identity)["lesson"]["queue"][0], expected)
+
+    def test_failed_save_blocks_exit_and_keeps_in_memory_progress(self):
+        self.app.game["pet_name"] = "Не терять"
+        with patch.object(self.store, "save_game", side_effect=OSError("disk full")):
+            self.app.request_exit()
+        self.assertTrue(self.app.running)
+        self.assertNotEqual(self.app.screen, "exit_confirm")
+        self.assertEqual(self.app.game["pet_name"], "Не терять")
+
+    def test_browser_exit_shows_saved_message_instead_of_trying_to_close_tab(self):
+        self.app.request_exit()
+        with patch("main.sys.platform", "emscripten"):
+            self.app.confirm_exit()
+        self.assertEqual(self.app.screen, "exited")
+        self.assertFalse(self.app.running)
+        self.app.draw()
+
+    def test_android_back_in_garden_opens_exit_confirmation(self):
+        self.app.screen = "home"
+        self.app.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_AC_BACK))
+        self.assertEqual(self.app.screen, "exit_confirm")
+
+    def test_second_window_close_does_not_replace_exit_cancel_destination(self):
+        self.app.screen = "home"
+        self.app.handle_event(pygame.event.Event(pygame.QUIT))
+        self.app.handle_event(pygame.event.Event(pygame.QUIT))
+        self.assertEqual(self.app.exit_return, "home")
+
+    def test_small_text_is_not_rendered_below_accessible_minimum(self):
+        with patch("pygame.font.Font", wraps=pygame.font.Font) as fonts:
+            main.text(self.app.canvas, "Нужен уход", 16, (500, 300), main.RED)
+        self.assertTrue(all(call.args[1] >= main.MIN_TEXT_SIZE for call in fonts.call_args_list))
+
+    def test_audio_error_is_a_readable_modal_without_clickthrough_to_pet(self):
+        self.set_pet_stage(1)
+        self.app.screen = "home"
+        self.app.audio_notice = "Не удалось озвучить слово. Попробуй ещё раз."
+        self.app.audio_notice_until = pygame.time.get_ticks() / 1000 + 10
+        with patch.object(self.app, "button", wraps=self.app.button) as buttons:
+            self.app.draw()
+        self.assertEqual(buttons.call_args_list[-1].args[1], "ПОНЯТНО")
+        self.assertEqual(len(self.app.buttons), 1)
+        self.app.click((400, 300))
+        self.assertEqual(self.app.hearts.particles, [])
+
     def certify_pet(self):
+        clear_checkpoints(self.app.game)
         exam = start_final_test(self.app.game)
         for expected in exam["queue"][:]:
             answer_final_test(self.app.game, expected)
@@ -202,25 +265,23 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.pet_game.hits, 1)
         self.assertEqual(self.app.pet_game.phase, "celebrate")
 
-    def test_thirtieth_mastered_word_interrupts_and_then_resumes_the_lesson(self):
+    def test_fiftieth_mastered_word_interrupts_and_then_resumes_the_lesson(self):
         self.app.game = new_game()
         for session in (1, 2):
             self.app.game["session"] = session
-            for word in WORDS[:29]:
+            for word in WORDS[:49]:
                 main.record_answer(self.app.game, word["id"], True)
-        target, following = WORDS[29]["id"], WORDS[30]["id"]
+        self.app.game["growth_notice"] = None
+        target, following = WORDS[49]["id"], WORDS[50]["id"]
         self.app.game["cards"][target] = {"seen": True, "correct_sessions": [1]}
         self.app.queue = [target, following]
         self.app.screen = "cards"
         self.app.card_index = 0
         self.app.prepare_card()
         self.app.answer(target)
-        self.assertEqual(self.app.screen, "growth")
-        self.app.draw()
-        self.app.acknowledge_growth()
         self.app.next_card()
         self.assertEqual(self.app.screen, "review")
-        self.assertEqual(self.app.game["active_review"]["milestone"], 30)
+        self.assertEqual(self.app.game["active_review"]["milestone"], 50)
         self.assertEqual(self.app.game["lesson"]["index"], 1)
         before = self.app.game["correct_answers"]
         self.app.draw()
@@ -235,7 +296,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.word_id, following)
         self.assertEqual(self.app.card_index, 1)
         self.assertEqual(self.app.game["correct_answers"], before)
-        self.assertEqual(self.app.game["reviews"][0]["score"], 6)
+        self.assertEqual(self.app.game["reviews"][0]["score"], 20)
 
     def test_review_survives_pause_and_restart_without_recounting_answers(self):
         self.set_pet_stage(2)
@@ -300,6 +361,7 @@ class AppTests(unittest.TestCase):
             self.app.game["session"] = session
             for word in WORDS:
                 main.record_answer(self.app.game, word["id"], True)
+                clear_checkpoints(self.app.game)
         self.app.game["pet_name"] = "Пушок"
         self.certify_pet()
         self.app.open_zoo()
@@ -375,35 +437,52 @@ class AppTests(unittest.TestCase):
                 union = baby.count() + adult.count() - overlap
                 self.assertGreater(difference / union, 0.08)
 
-    def test_final_test_blocks_next_species_until_seven_correct_answers(self):
+    def test_final_test_blocks_next_species_until_35_out_of_50_and_corrections(self):
         for session in (1, 2):
             self.app.game["session"] = session
             for word in WORDS:
                 main.record_answer(self.app.game, word["id"], True)
+                clear_checkpoints(self.app.game)
         self.app.open_zoo()
         self.app.settle_current_pet()
         self.assertEqual(self.app.screen, "final_test")
         for i, expected in enumerate(self.app.game["zoo"]["exam"]["queue"][:]):
-            self.app.submit_final_test(expected if i < 6 else next(word["id"] for word in WORDS if word["id"] != expected))
+            self.app.submit_final_test(expected if i < 34 else next(word["id"] for word in WORDS if word["id"] != expected))
             self.app.draw()
             self.app.next_final_test()
         self.app.draw()
         self.assertEqual(current_species(self.app.game), "sniffer")
+        self.finish_ui_repairs()
         self.app.pause_final_test()
         self.app.open_final_test(retry=True)
         for i, expected in enumerate(self.app.game["zoo"]["exam"]["queue"][:]):
-            self.app.submit_final_test(expected if i < 7 else next(word["id"] for word in WORDS if word["id"] != expected))
+            self.app.submit_final_test(expected if i < 35 else next(word["id"] for word in WORDS if word["id"] != expected))
             self.app.next_final_test()
         self.app.draw()
+        self.assertFalse(main.final_passed(self.app.game))
+        self.finish_ui_repairs()
         self.app.settle_current_pet()
         self.assertEqual(current_species(self.app.game), "axolotl")
         self.assertEqual(self.app.screen, "zoo")
+
+    def finish_ui_repairs(self):
+        self.app.begin_repairs(True)
+        exam = self.app.game["zoo"]["exam"]
+        for _ in range(400):
+            if exam["phase"] == "summary":
+                return
+            if exam["phase"] == "repair_quiz":
+                self.app.submit_final_test(expected_word(exam))
+            else:
+                self.app.next_final_test()
+        self.fail("UI corrections did not finish")
 
     def test_replay_confirmation_keeps_grown_friend_and_creates_a_new_egg(self):
         for session in (1, 2):
             self.app.game["session"] = session
             for word in WORDS:
                 main.record_answer(self.app.game, word["id"], True)
+                clear_checkpoints(self.app.game)
         self.certify_pet()
         self.app.settle_current_pet()
         self.app.request_replay(0)
@@ -533,7 +612,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.game, before)
 
     def test_paused_checks_ignore_old_answer_and_next_callbacks(self):
-        self.set_pet_stage(1)
+        self.set_pet_stage(2)
         self.app.start_lesson()
         first = self.app.game["active_review"]["queue"][0]
         self.app.submit_review(first)

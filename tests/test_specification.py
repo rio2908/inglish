@@ -6,14 +6,16 @@ from game_logic import CARE_MAX, GROWTH_THRESHOLDS
 from instructions import HELP_PAGES
 from learning_stats import MILESTONES, REVIEW_SIZE
 from words import ALL_WORDS, WORD_BANKS
-from zoo import SPECIES
+from zoo import SPECIES, final_size, pass_mark
 
 
 class SpecificationTests(unittest.TestCase):
     def test_approved_balance_constants_are_not_changed_silently(self):
         self.assertEqual(GROWTH_THRESHOLDS, (30, 60, 90, 120))
-        self.assertEqual(MILESTONES, (30, 60, 90, 120, 150))
-        self.assertEqual(REVIEW_SIZE, 6)
+        self.assertEqual(MILESTONES, (50, 100, 150))
+        self.assertEqual(REVIEW_SIZE, 20)
+        self.assertEqual([final_size(key) for key, _ in SPECIES], [50, 60, 70, 80, 90, 100])
+        self.assertEqual([pass_mark(final_size(key)) for key, _ in SPECIES], [35, 42, 49, 56, 63, 70])
         self.assertEqual(CARE_MAX, 3)
         self.assertEqual([key for key, _ in SPECIES], ["sniffer", "axolotl", "fox", "bee", "turtle", "allay"])
         self.assertEqual(len(ALL_WORDS), 900)

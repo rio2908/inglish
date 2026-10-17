@@ -3,6 +3,8 @@
 import copy
 import random
 from grammar import form_choices
+from assessments import (advance_correction, answer_correction, expected_word, normalize_test,
+                         passed, score, start_corrections)
 
 from words import WORD_BY_ID, words_for_species
 
@@ -12,6 +14,33 @@ SPECIES = (
     ("bee", "Пчела"), ("turtle", "Черепаха"), ("allay", "Эллей"),
 )
 SPECIES_NAMES = dict(SPECIES)
+
+
+def final_size(species):
+    return 50 + 10 * [key for key, _ in SPECIES].index(species)
+
+
+def pass_mark(total):
+    return (total * 7 + 9) // 10
+
+
+def exam_queue(species, priority, rng=None, prefix=()):
+    """Equal representation of ten chapters; retain answered legacy questions."""
+    rng = rng or random
+    pool = words_for_species(species)
+    queue = list(prefix)
+    quota = final_size(species) // 10
+    for chapter in range(10):
+        candidates = [word["id"] for word in pool if word["chapter"] == chapter and word["id"] not in queue]
+        rng.shuffle(candidates)
+        candidates.sort(key=lambda word: word not in priority)
+        existing = sum(WORD_BY_ID[word]["chapter"] == chapter for word in queue)
+        queue.extend(candidates[:max(0, quota - existing)])
+    # A legacy prefix may overrepresent a chapter; do not change its answers.
+    queue = queue[:final_size(species)]
+    if not prefix:
+        rng.shuffle(queue)
+    return queue
 
 
 def new_zoo():
@@ -70,22 +99,22 @@ def normalize_zoo(raw, allow_replay=True):
     if isinstance(history, list):
         for result in history:
             if (isinstance(result, dict) and isinstance(result.get("species"), str) and result["species"] in SPECIES_NAMES
-                    and type(result.get("score")) is int and 0 <= result["score"] <= 10
+                    and type(result.get("total", 10)) is int and result.get("total", 10) in (10, final_size(result["species"]))
+                    and type(result.get("score")) is int and 0 <= result["score"] <= result.get("total", 10)
                     and type(result.get("cycle", 0)) is int and 0 <= result.get("cycle", 0) <= zoo["serial"]):
-                zoo["exam_history"].append({"species": result["species"], "cycle": result.get("cycle", 0), "score": result["score"], "total": 10})
+                zoo["exam_history"].append({"species": result["species"], "cycle": result.get("cycle", 0), "score": result["score"], "total": result.get("total", 10)})
     exam = raw.get("exam")
     if isinstance(exam, dict):
-        queue, answers = exam.get("queue"), exam.get("answers")
-        if (isinstance(queue, list) and len(queue) == 10
-                and all(isinstance(word_id, str) and word_id in WORD_BY_ID and WORD_BY_ID[word_id]["species"] == zoo["active"] for word_id in queue)
-                and len(set(queue)) == 10 and isinstance(answers, list) and len(answers) <= 10
-                and all(isinstance(word_id, str) and word_id in WORD_BY_ID for word_id in answers)):
-            phase = exam.get("phase")
-            if phase not in ("quiz", "feedback", "summary") or (phase == "feedback" and not answers) or (phase == "summary" and len(answers) < 10):
-                phase = "quiz"
-            if len(answers) == 10 and phase == "quiz":
-                phase = "feedback"
-            zoo["exam"] = {"queue": queue[:], "answers": answers[:], "phase": phase}
+        pool = {word["id"] for word in words_for_species(zoo["active"])}
+        test = normalize_test(exam, pool, final_size(zoo["active"]))
+        if test is None:
+            legacy = normalize_test(exam, pool, 10)
+            if legacy:
+                legacy["queue"] = exam_queue(zoo["active"], [], random.Random(0), legacy["queue"])
+                if legacy["phase"] == "summary":
+                    legacy["phase"] = "quiz"
+                test = legacy
+        zoo["exam"] = test
     return zoo
 
 
@@ -115,19 +144,28 @@ def record_pet_answer(game, word_id, correct):
 
 
 def growth_complete(game):
+    from learning_stats import pending_review
     return ((len(game["zoo"]["residents"]) < len(SPECIES) or game["zoo"]["replay"])
             and pet_learned_count(game) == 150
-            and game["lesson"] is None and game["active_review"] is None)
+            and game["lesson"] is None and game["active_review"] is None and pending_review(game) is None)
 
 
 def final_score(game):
     exam = game["zoo"]["exam"]
-    return sum(a == b for a, b in zip(exam["queue"], exam["answers"])) if exam else 0
+    return score(exam) if exam else 0
 
 
 def final_passed(game):
     exam = game["zoo"]["exam"]
-    return bool(exam and len(exam["answers"]) == 10 and final_score(game) >= 7)
+    species = current_species(game)
+    return bool(exam and isinstance(exam.get("queue"), list) and len(exam["queue"]) == final_size(species)
+                and all(isinstance(word, str) and word in WORD_BY_ID and WORD_BY_ID[word]["species"] == species for word in exam["queue"])
+                and len(set(exam["queue"])) == len(exam["queue"]) and passed(exam))
+
+
+def repair_final_test(game):
+    exam = game["zoo"]["exam"]
+    return bool(exam and start_corrections(exam))
 
 
 def ready_for_zoo(game):
@@ -138,23 +176,21 @@ def start_final_test(game, rng=None, retry=False):
     if not growth_complete(game):
         return None
     old = game["zoo"]["exam"]
-    if old and (old["phase"] != "summary" or not retry or final_passed(game)):
+    from assessments import corrected
+    if old and (old["phase"] != "summary" or not retry or final_passed(game) or not corrected(old)):
         return old
     rng = rng or random
-    pool = [word["id"] for word in words_for_species(current_species(game))]
-    queue = [word_id for word_id in game["repeat_words"] if word_id in pool][:10]
-    queue += rng.sample([word_id for word_id in pool if word_id not in queue], 10 - len(queue))
-    rng.shuffle(queue)
+    queue = exam_queue(current_species(game), game["repeat_words"], rng)
     game["zoo"]["exam"] = {"queue": queue, "answers": [], "phase": "quiz"}
     return game["zoo"]["exam"]
 
 
 def final_choices(game, rng=None):
     exam = game["zoo"]["exam"]
-    if not exam or exam["phase"] != "quiz":
+    if not exam or exam["phase"] not in ("quiz", "repair_quiz"):
         return []
     rng = rng or random
-    expected = exam["queue"][len(exam["answers"])]
+    expected = expected_word(exam)
     contextual = form_choices(expected, rng)
     if contextual is not None:
         return contextual
@@ -167,23 +203,28 @@ def final_choices(game, rng=None):
 
 def answer_final_test(game, chosen):
     exam = game["zoo"]["exam"]
-    if not exam or exam["phase"] != "quiz" or not isinstance(chosen, str) or chosen not in WORD_BY_ID or len(exam["answers"]) >= 10:
+    from learning_stats import record_attempt
+    if exam and exam["phase"] == "repair_quiz":
+        return answer_correction(exam, chosen, record_attempt, game)
+    if not exam or exam["phase"] != "quiz" or not isinstance(chosen, str) or chosen not in WORD_BY_ID or len(exam["answers"]) >= len(exam["queue"]):
         return False
     # Deferred import avoids coupling basic zoo state to the statistics module at load time.
-    from learning_stats import record_attempt
     expected = exam["queue"][len(exam["answers"])]
     record_attempt(game, expected, chosen == expected, review=True)
     exam["answers"].append(chosen)
     exam["phase"] = "feedback"
-    if len(exam["answers"]) == 10:
-        game["zoo"]["exam_history"].append({"species": current_species(game), "cycle": game["zoo"]["cycle"], "score": final_score(game), "total": 10})
+    if len(exam["answers"]) == len(exam["queue"]):
+        game["zoo"]["exam_history"].append({"species": current_species(game), "cycle": game["zoo"]["cycle"], "score": final_score(game), "total": len(exam["queue"])})
     return True
 
 
 def advance_final_test(game):
     exam = game["zoo"]["exam"]
+    if exam and exam["phase"].startswith("repair_"):
+        advance_correction(exam)
+        return
     if exam and exam["phase"] == "feedback":
-        exam["phase"] = "summary" if len(exam["answers"]) == 10 else "quiz"
+        exam["phase"] = "summary" if len(exam["answers"]) == len(exam["queue"]) else "quiz"
 
 
 def _fresh_pet(game):

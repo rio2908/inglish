@@ -8,6 +8,7 @@ from game_logic import (
     play, record_answer, start_session,
 )
 from words import WORDS
+from learning_fixtures import clear_checkpoints
 
 
 class GameLogicTests(unittest.TestCase):
@@ -135,6 +136,7 @@ class GameLogicTests(unittest.TestCase):
         transitions = []
         for count, word in enumerate(WORDS, start=1):
             record_answer(game, word["id"], True)
+            clear_checkpoints(game)
             if game["growth_notice"]:
                 transitions.append((count, game["growth_notice"]["before"], game["growth_notice"]["after"]))
                 game["growth_notice"] = None

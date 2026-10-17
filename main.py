@@ -12,7 +12,7 @@ import pygame
 from game_logic import (
     can_explore, choice_ids, clean, egg_frame, explore, feed, finish_session,
     growth_stage, hatch_complete, mark_seen, mastered, mastered_count,
-    clean_pet_name, growth_remaining, new_game, play, record_answer, start_session,
+    clean_pet_name, growth_remaining, lesson_retry, new_game, play, record_answer, start_session,
 )
 from game_backup import ProfilePicker
 from game_storage import read_player_backup_bytes
@@ -23,6 +23,7 @@ from grammar import FORM_QUESTIONS, NOTES
 from learning_stats import (
     advance_review, answer_review, pending_review, review_choices, review_score,
     review_cycle, review_species, start_review, statistics, word_status,
+    MILESTONES, repair_review, retry_review, review_passed,
 )
 from pet_games import GAME_NAMES, MOVES, TOOLS, PetGame
 from pet_behavior import HeartBurst, LABELS, PetBehavior
@@ -36,10 +37,13 @@ from zoo import (
     SPECIES, SPECIES_NAMES, advance_final_test, answer_final_test, begin_replay, can_replay,
     current_species, final_choices, final_passed, growth_complete,
     pet_learned_count, ready_for_zoo, settle_pet, start_final_test,
+    final_size, pass_mark, repair_final_test,
 )
+from assessments import corrected, expected_word, mistakes, score_passed
 
 
 WIDTH, HEIGHT = 1000, 600
+MIN_TEXT_SIZE = 26
 ROOT = Path(__file__).resolve().parent
 AUDIO_DIR = ROOT / "assets" / "audio"
 
@@ -72,9 +76,10 @@ STORIES = [
 
 
 def text(surf, value, size, center, color=INK, bold=False, backdrop=None, max_width=None):
+    size = max(MIN_TEXT_SIZE, size)
     font = pygame.font.Font(None, size)
     font.set_bold(bold)
-    while max_width and font.size(str(value))[0] > max_width and size > 16:
+    while max_width and font.size(str(value))[0] > max_width and size > MIN_TEXT_SIZE:
         size -= 1
         font = pygame.font.Font(None, size)
         font.set_bold(bold)
@@ -143,9 +148,10 @@ def word_hint_icon(surface, kind, x, y, color):
 
 
 def word_hint_row(surface, value, kind, center, size, color, bold=False):
+    size = max(MIN_TEXT_SIZE, size)
     font = pygame.font.Font(None, size)
     font.set_bold(bold)
-    while font.size(value)[0] > 380 and size > 16:
+    while font.size(value)[0] > 380 and size > MIN_TEXT_SIZE:
         size -= 1
         font = pygame.font.Font(None, size)
         font.set_bold(bold)
@@ -157,9 +163,10 @@ def word_hint_row(surface, value, kind, center, size, color, bold=False):
 
 def contextual_sentence(surface, subject, form, ending, center, size=29, max_width=720, focus=None):
     """Keep the subject and verb visually distinct, without relying only on prose."""
+    size = max(MIN_TEXT_SIZE, size)
     font = pygame.font.Font(None, size)
     font.set_bold(True)
-    while sum(font.size(part)[0] for part in (subject, form, ending)) + 18 > max_width and size > 16:
+    while sum(font.size(part)[0] for part in (subject, form, ending)) + 18 > max_width and size > MIN_TEXT_SIZE:
         size -= 1
         font = pygame.font.Font(None, size)
         font.set_bold(True)
@@ -396,11 +403,13 @@ class GameApp:
             self.session_answer_count = lesson["answers"]
             self.options = choice_ids(self.word_id)
             self.screen = "cards"
+        if self.game["active_review"] is None and pending_review(self.game) is not None:
+            start_review(self.game)
         if self.game["active_review"] is not None:
             self.review_options = review_choices(self.game)
             self.screen = "review"
         exam = self.game["zoo"]["exam"]
-        if exam is not None and exam["phase"] in ("quiz", "feedback"):
+        if exam is not None and self.game["active_review"] is None and exam["phase"] != "summary":
             self.final_options = final_choices(self.game)
             self.screen = "final_test"
         if self.game.get("growth_notice"):
@@ -611,10 +620,18 @@ class GameApp:
             self.audio_notice = ""
             self.audio_notice_until = 0
 
+    def dismiss_audio_notice(self):
+        self.audio_notice = ""
+        self.audio_notice_until = 0
+        self.notice_visible = False
+
     def start_lesson(self):
+        if pending_review(self.game) is not None and self.game["active_review"] is None and not self.game["growth_notice"]:
+            self.open_review()
+            return
         exam = self.game["zoo"]["exam"]
         if (self.game["growth_notice"] or self.game["lesson"] or self.game["active_review"] is not None
-                or (exam and exam["phase"] in ("quiz", "feedback"))):
+                or (exam and exam["phase"] != "summary")):
             self.restore_lesson()
             return
         if pending_review(self.game) is not None:
@@ -669,6 +686,11 @@ class GameApp:
         before_hatch = hatch_complete(self.game)
         before_crack = egg_frame(self.game)
         self.just_mastered = record_answer(self.game, self.word_id, self.answer_correct)
+        if not self.answer_correct:
+            self.queue = lesson_retry(self.game, self.queue, self.card_index, self.word_id)
+            if len(self.queue) > 150:
+                self.queue = self.queue[self.card_index:]
+                self.card_index = 0
         self.just_hatched = not before_hatch and hatch_complete(self.game)
         self.crack_advanced = egg_frame(self.game) > before_crack
         if self.just_hatched:
@@ -710,7 +732,7 @@ class GameApp:
             self.persist()
 
     def next_review(self):
-        if self.screen != "review" or self.game["active_review"] is None or self.game["active_review"]["phase"] != "feedback":
+        if self.screen != "review" or self.game["active_review"] is None or self.game["active_review"]["phase"] not in ("feedback", "repair_intro", "repair_feedback"):
             return
         advance_review(self.game)
         self.review_options = review_choices(self.game)
@@ -720,10 +742,54 @@ class GameApp:
         review = self.game["active_review"]
         if self.screen != "review" or review is None or review["phase"] != "summary":
             return
+        if not corrected(review):
+            self.begin_repairs(False)
+            return
+        if len(review["queue"]) == 20 and not review_passed(review):
+            retry_review(self.game)
+            self.review_options = review_choices(self.game)
+            self.persist()
+            return
         self.game["active_review"] = None
         self.screen = "home"
         self.restore_lesson()
         self.persist()
+
+    def begin_repairs(self, final):
+        if self.screen != ("final_test" if final else "review"):
+            return
+        if repair_final_test(self.game) if final else repair_review(self.game):
+            self.persist()
+
+    def request_exit(self):
+        if self.screen in ("exit_confirm", "exited"):
+            return
+        if not self.persist():
+            return
+        self.exit_return = self.screen
+        self.speech.stop()
+        pygame.key.stop_text_input()
+        self.screen = "exit_confirm"
+
+    def confirm_exit(self):
+        if self.screen != "exit_confirm" or not self.persist():
+            return
+        self.speech.stop()
+        self.running = False
+        if sys.platform == "emscripten":
+            self.screen = "exited"
+
+    def draw_exit(self):
+        self.draw_background()
+        self.draw_header()
+        panel(self.canvas, pygame.Rect(120, 150, 760, 330))
+        text(self.canvas, "ИГРА СОХРАНЕНА" if self.screen == "exited" else "ВЫЙТИ ИЗ ИГРЫ?", 40, (500, 215), TEAL, True)
+        text(self.canvas, "Можно продолжить с того же места.", 30, (500, 280), INK)
+        if self.screen == "exited":
+            text(self.canvas, "Теперь можно закрыть вкладку браузера.", 30, (500, 350), INK)
+        else:
+            self.button((180, 355, 290, 65), "ВЫЙТИ", self.confirm_exit, fill=RED, size=32)
+            self.button((530, 355, 290, 65), "ОСТАТЬСЯ", lambda: setattr(self, "screen", self.exit_return), size=32)
 
     def pause_review(self):
         self.screen = "home"
@@ -775,7 +841,7 @@ class GameApp:
             self.persist()
 
     def next_final_test(self):
-        if self.screen != "final_test" or self.game["zoo"]["exam"] is None or self.game["zoo"]["exam"]["phase"] != "feedback":
+        if self.screen != "final_test" or self.game["zoo"]["exam"] is None or self.game["zoo"]["exam"]["phase"] not in ("feedback", "repair_intro", "repair_feedback"):
             return
         advance_final_test(self.game)
         self.final_options = final_choices(self.game)
@@ -983,13 +1049,12 @@ class GameApp:
             self.button((701, 402, 238, 45), "Убрать", self.do_clean, enabled=self.game["poop"], fill=(100, 117, 79), size=26)
         milestone = pending_review(self.game)
         exam = self.game["zoo"]["exam"]
-        testing = self.game["active_review"] is not None or (exam and exam["phase"] in ("quiz", "feedback"))
+        testing = self.game["active_review"] is not None or (exam and exam["phase"] != "summary")
         label = "ПРОДОЛЖИТЬ ТЕСТ" if testing else "ПРОДОЛЖИТЬ УРОК" if self.game["lesson"] else f"ПРОВЕРКА: {milestone} СЛОВ" if milestone else "УЧИТЬ СЛОВА"
         self.button((35, 506, 365, 63), label, self.start_lesson, fill=TEAL, size=36 if label == "УЧИТЬ СЛОВА" else 29)
         available = self.game["garden_plants"] < min(10, mastered_count(self.game) // 15)
-        self.button((420, 506, 232, 63), "ИСКАТЬ СЕМЕНА", self.do_explore, enabled=can_explore(self.game), fill=(119, 138, 65), size=27)
-        if available and not can_explore(self.game):
-            text(self.canvas, "Сначала позаботься о питомце", 20, (536, 491), RED, True)
+        seed_label = "НУЖЕН УХОД" if available and not can_explore(self.game) else "ИСКАТЬ СЕМЕНА"
+        self.button((420, 506, 232, 63), seed_label, self.do_explore, enabled=can_explore(self.game), fill=(119, 138, 65), size=27)
         self.button((676, 506, 175, 63), "СЛОВАРИК", self.open_dictionary, fill=(88, 129, 155), size=25)
         self.button((865, 506, 100, 63), "СПРАВКА", self.open_help, fill=(100, 111, 125), size=19)
         if self.message:
@@ -1065,8 +1130,9 @@ class GameApp:
                 label = option["en"] if contextual else option["ru"] if self.quiz_mode == "meaning" else option["en"]
                 self.button((194, 299 + i * 76, 612, 60), label, lambda chosen=option_id: self.answer(chosen), fill=(90, 126, 111), size=35)
         else:
-            badge = "ПРАВИЛЬНО!" if self.answer_correct else "ПОПРОБУЕМ ЕЩЁ ПОЗЖЕ"
+            badge = "ПРАВИЛЬНО!" if self.answer_correct else "ДАВАЙ ЗАПОМНИМ"
             text(self.canvas, badge, 42, (500, 172), TEAL if self.answer_correct else RED, True)
+            self.button((785, 140, 115, 50), "ЗВУК", lambda: self.play_audio(self.word_id), fill=(88, 129, 155), size=27)
             self.draw_letter_tiles(word["en"], 500, 223, 37 if len(word["en"]) < 10 else 29)
             text(self.canvas, word["hint"], 40, (300, 293), RED)
             text(self.canvas, word["ru"], 40, (690, 293), TEAL, True)
@@ -1090,8 +1156,6 @@ class GameApp:
                     text(self.canvas, f"Слов для питомца: {pet_learned_count(self.game)} / 150", 24 if word["id"] in NOTES else 27, (500, 443 if word["id"] in NOTES else 380), TEAL, True)
                 self.button((365, 460, 270, 67), "ДАЛЬШЕ", self.next_card, size=34)
         self.button((78, 513, 121, 40), "В САД", self.leave_cards, fill=(124, 111, 89), size=22)
-        if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
-            text(self.canvas, self.audio_notice, 21, (500, 585), INK)
 
     def leave_cards(self):
         saved = self.persist()
@@ -1288,8 +1352,6 @@ class GameApp:
         text(self.canvas, russian_2, 24, (500, 430), (94, 92, 78))
         self.button((284, 475, 190, 52), "СЛУШАТЬ", lambda: self.play_audio(english_1 + " " + english_2), fill=(88, 129, 155), size=26)
         self.button((526, 475, 190, 52), "В САД", lambda: setattr(self, "screen", "home"), size=28)
-        if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
-            text(self.canvas, self.audio_notice, 20, (500, 573), INK)
 
     def draw_profile(self):
         self.draw_background()
@@ -1305,7 +1367,8 @@ class GameApp:
         text(self.canvas, "Все слова, питомцы и проверки сохраняются только этому игроку.", 24, (500, 375), INK)
         text(self.canvas, "Перед удалением игры выгрузите профиль в отдельный файл.", 24, (500, 411), INK)
         text(self.canvas, "После переустановки загрузите этот файл здесь.", 24, (500, 442), INK)
-        self.button((390, 487, 220, 49), "В САД", lambda: setattr(self, "screen", "home"), size=27)
+        self.button((180, 487, 280, 49), "В САД", lambda: setattr(self, "screen", "home"), size=27)
+        self.button((520, 487, 300, 49), "ВЫЙТИ ИЗ ИГРЫ", self.request_exit, fill=RED, size=27)
         # Keep long platform errors inside the screen.
         text(self.canvas, self.profile_notice[:95], 21, (500, 580), INK)
 
@@ -1331,6 +1394,7 @@ class GameApp:
         self.button((900, 300, 65, 45), ">", lambda: setattr(self, "login_page", self.login_page + 1), enabled=(self.login_page + 1) * 3 < len(self.profile_cache))
         self.button((140, 490, 340, 51), "НОВЫЙ ИГРОК", self.open_registration, enabled=not bool(self.storage_error), size=28)
         self.button((520, 490, 340, 51), "ЗАГРУЗИТЬ ПРОФИЛЬ", lambda: self.transfer_profile(False), enabled=not bool(self.storage_error), size=25)
+        self.button((535, 10, 220, 43), "ВЫХОД", self.request_exit, fill=RED, size=27)
         text(self.canvas, (self.storage_error or self.login_notice)[:105], 21, (500, 582), RED if self.storage_error else INK)
 
     def draw_registration(self):
@@ -1408,27 +1472,30 @@ class GameApp:
         text(self.canvas, title, 34, (500, 112), TEAL, True)
         if review["phase"] == "summary":
             text(self.canvas, f"Верно: {review_score(review)} / {len(review['queue'])}", 45, (500, 194), TEAL, True)
-            mistakes = [word_id for word_id, chosen in zip(review["queue"], review["answers"]) if word_id != chosen]
-            passed = final_passed(self.game) if final else True
-            caption = ("Тест пройден!" if passed else "Нужно минимум 7 из 10. Попробуем ещё!") if final else ("Эти слова повторим в следующих проверках:" if mistakes else "Отлично! Все ответы верны!")
-            text(self.canvas, caption, 27, (500, 248), TEAL if passed else RED, True)
-            for i, word_id in enumerate(mistakes):
-                word = WORD_BY_ID[word_id]
-                text(self.canvas, f"{word['en']} — {word['ru']}", 24,
-                     (290 + (i % 2) * 420, 286 + (i // 2) * 31), TEAL, max_width=395)
-            text(self.canvas, "Результат сохранён. Выученные слова и рост не пропадают.", 24, (500, 457), INK)
+            cleared = corrected(review)
+            passed = final_passed(self.game) if final else review_passed(review)
+            mark = pass_mark(len(review["queue"]))
+            caption = "Тест пройден!" if passed else "Баллов достаточно. Исправим ошибки." if score_passed(review) else f"Для сдачи нужно {mark} из {len(review['queue'])}."
+            text(self.canvas, caption, 33, (500, 255), TEAL if score_passed(review) else RED, True)
+            text(self.canvas, f"Ошибок в первой попытке: {len(mistakes(review))}", 30, (500, 315), INK)
+            text(self.canvas, "Ошибки исправлены. Оценка не изменена." if cleared else "Теперь разберём и повторим ошибочные слова.", 29, (500, 365), INK)
+            text(self.canvas, "Слова и питомец остаются с тобой.", 29, (500, 415), TEAL)
             if final:
-                self.button((240, 493, 250, 57), "ЗАВЕРШИТЬ" if passed else "ЕЩЁ РАЗ", self.settle_current_pet if passed else lambda: self.open_final_test(True), size=28)
-                self.button((520, 493, 250, 57), "В ЗООПАРК" if passed else "ПОВТОРИТЬ СЛОВА",
-                            self.pause_final_test if passed else lambda: self.open_dictionary(current_species(self.game)), size=25)
+                label = "РАЗОБРАТЬ ОШИБКИ" if not cleared else "ЗАВЕРШИТЬ" if passed else "НОВАЯ ПОПЫТКА"
+                action = (lambda: self.begin_repairs(True)) if not cleared else self.settle_current_pet if passed else lambda: self.open_final_test(True)
+                self.button((130, 460, 370, 57), label, action, size=28)
+                self.button((530, 460, 340, 57), "СЛОВАРИК", lambda: self.open_dictionary(current_species(self.game)), size=28)
             else:
-                self.button((340, 493, 320, 57), "ПРОДОЛЖИТЬ", self.close_review, size=31)
+                self.button((260, 460, 480, 57), "РАЗОБРАТЬ ОШИБКИ" if not cleared else "ПРОДОЛЖИТЬ" if passed or len(review["queue"]) == 6 else "НОВАЯ ПОПЫТКА", self.close_review, size=31)
+            self.button((78, 524, 140, 42), "ПОЗЖЕ", self.pause_final_test if final else self.pause_review, fill=(124, 111, 89), size=26)
             return
-        index = len(review["answers"]) - (1 if review["phase"] == "feedback" else 0)
-        word = WORD_BY_ID[review["queue"][index]]
+        repairing = review["phase"].startswith("repair_")
+        index = 0 if repairing else len(review["answers"]) - (1 if review["phase"] == "feedback" else 0)
+        word = WORD_BY_ID[expected_word(review)]
         contextual = FORM_QUESTIONS.get(word["id"])
-        text(self.canvas, f"Вопрос {index + 1} / {len(review['queue'])}", 25, (500, 153), INK)
-        if review["phase"] == "quiz":
+        caption = f"Работа над ошибками: осталось {len(review['corrections']['remaining'])}" if repairing else f"Вопрос {index + 1} / {len(review['queue'])} · блок {index // 10 + 1}"
+        text(self.canvas, caption, 28, (500, 153), INK)
+        if review["phase"] in ("quiz", "repair_quiz"):
             text(self.canvas, "Вставь пропущенное слово" if contextual else "Выбери перевод" if index % 2 == 0 else "Выбери английское слово", 33, (500, 205), INK, True)
             if contextual:
                 subject, ending, russian = contextual
@@ -1442,8 +1509,8 @@ class GameApp:
                 self.button((194, 307 + i * 65, 612, 54), option["en"] if contextual else option["ru"] if index % 2 == 0 else option["en"],
                             lambda chosen=word_id: self.submit_final_test(chosen) if final else self.submit_review(chosen), size=32)
         else:
-            correct = review["answers"][index] == word["id"]
-            text(self.canvas, "ПРАВИЛЬНО!" if correct else "ДАВАЙ ЗАПОМНИМ", 39, (500, 221), TEAL if correct else RED, True)
+            correct = review["corrections"]["correct"] if repairing else review["answers"][index] == word["id"]
+            text(self.canvas, "ЗАПОМНИ СЛОВО" if review["phase"] == "repair_intro" else "ПРАВИЛЬНО!" if correct else "ДАВАЙ ЗАПОМНИМ", 39, (500, 221), TEAL if correct else RED, True)
             if contextual:
                 contextual_sentence(self.canvas, contextual[0], word["en"], contextual[1], (500, 288), size=39)
             else:
@@ -1451,12 +1518,11 @@ class GameApp:
             text(self.canvas, word["hint"], 42, (500, 341), RED, max_width=780)
             text(self.canvas, contextual[2] if contextual else word["ru"], 42, (500, 393), TEAL, True, max_width=780)
             if contextual:
-                for i, line in enumerate(textwrap.wrap(NOTES[word["id"]][0], width=88)[:2]):
-                    text(self.canvas, line, 21, (500, 427 + i * 22), INK, max_width=790)
-            self.button((345, 470, 310, 60), "ИТОГИ" if len(review["answers"]) == len(review["queue"]) else "ДАЛЬШЕ", self.next_final_test if final else self.next_review, size=31)
+                for i, line in enumerate(textwrap.wrap(NOTES[word["id"]][0], width=72)[:2]):
+                    text(self.canvas, line, 26, (500, 429 + i * 24), INK, max_width=790)
+            self.button((760, 225, 150, 52), "СЛУШАТЬ", lambda: self.play_audio(word["en"]), fill=(88, 129, 155), size=26)
+            self.button((345, 470, 310, 60), "ЗАПОМНИЛИ" if review["phase"] == "repair_intro" else "ИТОГИ" if not repairing and len(review["answers"]) == len(review["queue"]) else "ДАЛЬШЕ", self.next_final_test if final else self.next_review, size=31)
         self.button((78, 517, 140, 36), "ПОЗЖЕ", self.pause_final_test if final else self.pause_review, fill=(124, 111, 89), size=23)
-        if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
-            text(self.canvas, self.audio_notice, 21, (500, 585), INK)
 
     def draw_statistics(self):
         self.draw_background()
@@ -1503,8 +1569,8 @@ class GameApp:
             owner, species_name = SPECIES[self.stats_review_index]
             cycle = self.game["zoo"]["cycle"] if owner == current_species(self.game) else max((review_cycle(item) for item in self.game["reviews"] if review_species(item) == owner), default=0)
             text(self.canvas, "Проверки питомца: " + species_name, 29, (500, 221), INK, True)
-            for i, milestone in enumerate((30, 60, 90, 120, 150)):
-                result = next((item for item in self.game["reviews"] if item["milestone"] == milestone and review_species(item) == owner and review_cycle(item) == cycle), None)
+            for i, milestone in enumerate(MILESTONES):
+                result = next((item for item in reversed(self.game["reviews"]) if item["total"] == 20 and item["milestone"] == milestone and review_species(item) == owner and review_cycle(item) == cycle), None)
                 if result:
                     label = f"Верно: {result['score']} / {result['total']}"
                 elif owner == current_species(self.game) and self.game["active_review"] and self.game["active_review"]["milestone"] == milestone:
@@ -1519,7 +1585,8 @@ class GameApp:
             last_index = max(last_index, len(self.game["zoo"]["residents"]) - 1)
             exam_result = next((item for item in reversed(self.game["zoo"]["exam_history"]) if item["species"] == owner and item["cycle"] == cycle), None)
             if exam_result:
-                text(self.canvas, f"Итоговый тест: {exam_result['score']} / 10 · нужно 7", 22, (500, 495), TEAL if exam_result["score"] >= 7 else RED)
+                total = exam_result["total"]
+                text(self.canvas, f"Итоговый тест: {exam_result['score']} / {total} · нужно {pass_mark(total)}", 28, (500, 495), TEAL if exam_result["score"] >= pass_mark(total) else RED)
             self.button((600, 517, 70, 37), "<", lambda: setattr(self, "stats_review_index", self.stats_review_index - 1), enabled=self.stats_review_index > 0)
             text(self.canvas, f"{self.stats_review_index + 1} / {last_index + 1}", 24, (750, 536), INK)
             self.button((830, 517, 70, 37), ">", lambda: setattr(self, "stats_review_index", self.stats_review_index + 1), enabled=self.stats_review_index < last_index)
@@ -1569,8 +1636,6 @@ class GameApp:
         self.button((590, 520, 60, 38), "<", lambda: setattr(self, "dictionary_page", self.dictionary_page - 1), enabled=self.dictionary_page > 0)
         text(self.canvas, f"{self.dictionary_page + 1} / {last_page + 1}", 24, (740, 540), INK)
         self.button((830, 520, 60, 38), ">", lambda: setattr(self, "dictionary_page", self.dictionary_page + 1), enabled=self.dictionary_page < last_page)
-        if pygame.time.get_ticks() / 1000 < self.audio_notice_until:
-            text(self.canvas, self.audio_notice, 21, (500, 585), INK)
 
     def draw_zoo(self):
         self.draw_background("sniffer")
@@ -1628,7 +1693,7 @@ class GameApp:
         self.button((35, 537, 180, 46), "В САД", lambda: setattr(self, "screen", "home"), size=26)
         self.button((227, 537, 90, 46), "СЛОВА", lambda: self.open_dictionary(current_species(self.game)), size=21)
         if len(residents) < len(SPECIES) or self.game["zoo"]["replay"]:
-            label = "ПРОЙТИ ИТОГОВЫЙ ТЕСТ · НУЖНО 70%"
+            label = f"ИТОГОВЫЙ ТЕСТ: {final_size(active)} СЛОВ · 70%"
             if final_passed(self.game):
                 label = "ЗАВЕРШИТЬ ПОВТОРНОЕ ВЫРАЩИВАНИЕ" if self.game["zoo"]["replay"] else "ПОСЕЛИТЬ ПИТОМЦА И ОТКРЫТЬ СЛЕДУЮЩЕГО"
             self.button((330, 537, 635, 46), label, self.settle_current_pet, enabled=growth_complete(self.game), size=23)
@@ -1704,10 +1769,12 @@ class GameApp:
 
     def draw(self):
         self.buttons = []
-        if self.player_id is None and self.screen not in ("login", "register", "import", "help"):
+        if self.player_id is None and self.screen not in ("login", "register", "import", "help", "exit_confirm", "exited"):
             self.screen = "login"
         if self.save_conflict:
             self.draw_save_conflict()
+        elif self.screen in ("exit_confirm", "exited"):
+            self.draw_exit()
         elif self.screen == "login":
             self.draw_login()
         elif self.screen == "register":
@@ -1746,6 +1813,14 @@ class GameApp:
             self.draw_replay_confirm()
         else:
             self.draw_help()
+        self.notice_visible = bool(self.audio_notice and pygame.time.get_ticks() / 1000 < self.audio_notice_until and not self.save_conflict)
+        if self.notice_visible:
+            self.buttons = []
+            panel(self.canvas, pygame.Rect(105, 165, 790, 290))
+            text(self.canvas, "ПРОСЛУШИВАНИЕ", 34, (500, 210), TEAL, True)
+            for i, line in enumerate(textwrap.wrap(self.audio_notice, width=49)[:3]):
+                text(self.canvas, line, 30, (500, 265 + i * 35), INK)
+            self.button((340, 380, 320, 55), "ПОНЯТНО", self.dismiss_audio_notice, size=30)
         display_size = self.display.get_size()
         scale = min(display_size[0] / WIDTH, display_size[1] / HEIGHT)
         view_size = (max(1, round(WIDTH * scale)), max(1, round(HEIGHT * scale)))
@@ -1769,7 +1844,7 @@ class GameApp:
         x = (screen_pos[0] - self.viewport.left) * WIDTH / self.viewport.width
         y = (screen_pos[1] - self.viewport.top) * HEIGHT / self.viewport.height
         point = (int(x), int(y))
-        if self.screen == "home" and not self.save_conflict:
+        if self.screen == "home" and not self.save_conflict and not self.notice_visible:
             if self.poop_rect and self.poop_rect.collidepoint(point):
                 self.input_ready = False
                 self.do_clean()
@@ -1787,11 +1862,15 @@ class GameApp:
                 return
 
     def handle_event(self, event):
+        if event.type == pygame.KEYDOWN and event.key == getattr(pygame, "K_AC_BACK", -1):
+            event = pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE)
+        if getattr(self, "notice_visible", False) and event.type == pygame.KEYDOWN:
+            self.dismiss_audio_notice()
+            return
         if self.save_conflict and event.type == pygame.KEYDOWN:
             return
         if event.type == pygame.QUIT:
-            self.persist()
-            self.running = False
+            self.request_exit()
         elif event.type in tuple(getattr(pygame, name, -1) for name in
                                  ("APP_WILLENTERBACKGROUND", "APP_DIDENTERBACKGROUND", "WINDOWFOCUSLOST")):
             self.persist()
@@ -1828,8 +1907,10 @@ class GameApp:
             elif event.key == pygame.K_ESCAPE:
                 self.cancel_name()
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            if self.screen == "login":
-                self.running = False
+            if self.screen in ("home", "login"):
+                self.request_exit()
+            elif self.screen == "exit_confirm":
+                self.screen = self.exit_return
             elif self.screen == "help":
                 self.close_help()
             elif self.screen == "growth":

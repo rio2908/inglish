@@ -7,20 +7,28 @@ from game_logic import (
     record_answer, start_session,
 )
 from game_storage import make_backup_bytes, read_backup_bytes
-from learning_stats import advance_review, answer_review, pending_review, start_review
+from learning_stats import pending_review
 from words import ALL_WORDS, WORD_BANKS, words_for_species
+from learning_fixtures import clear_checkpoints
+from assessments import expected_word
 from zoo import (
     SPECIES, advance_final_test, answer_final_test, begin_replay, current_species, final_passed,
-    growth_complete, normalize_zoo, pet_learned_count, ready_for_zoo, settle_pet, start_final_test,
+    growth_complete, normalize_zoo, pet_learned_count, ready_for_zoo, settle_pet, start_final_test, repair_final_test,
 )
 
 
-def pass_exam(game, correct=10):
+def pass_exam(game, correct=100):
     exam = start_final_test(game, random.Random(4), retry=True)
     for i, expected in enumerate(exam["queue"][:]):
         chosen = expected if i < correct else next(word["id"] for word in words_for_species(current_species(game)) if word["id"] != expected)
         answer_final_test(game, chosen)
         advance_final_test(game)
+    if repair_final_test(game):
+        while exam["phase"] != "summary":
+            if exam["phase"] == "repair_quiz":
+                answer_final_test(game, expected_word(exam))
+            else:
+                advance_final_test(game)
 
 
 def grow_current_pet(game, count=150, certify=True):
@@ -28,6 +36,7 @@ def grow_current_pet(game, count=150, certify=True):
         game["session"] += 1
         for word in words_for_species(current_species(game))[:count]:
             record_answer(game, word["id"], True)
+            clear_checkpoints(game)
     if count == 150 and certify:
         pass_exam(game)
 
@@ -147,29 +156,20 @@ class ZooTests(unittest.TestCase):
         self.assertEqual(pet_learned_count(restored), 55)
         self.assertEqual(len(restored["zoo"]["residents"]), 1)
 
-    def test_each_creature_gets_thirty_word_checks_without_erasing_earlier_results(self):
+    def test_each_creature_gets_its_own_three_checks_without_erasing_earlier_results(self):
         game = new_game()
         grow_current_pet(game)
-        first = start_review(game, random.Random(1))
-        for expected in first["queue"][:]:
-            answer_review(game, expected)
-            advance_review(game)
-        game["active_review"] = None
+        first_results = copy.deepcopy(game["reviews"])
         self.assertTrue(settle_pet(game))
         self.assertIsNone(pending_review(game))
-        grow_current_pet(game, 30)
-        self.assertEqual(pending_review(game), 30)
-        second = start_review(game, random.Random(2))
-        self.assertEqual(second["species"], "axolotl")
-        for expected in second["queue"][:]:
-            answer_review(game, expected)
-            advance_review(game)
+        grow_current_pet(game, 50)
         restored = read_backup_bytes(make_backup_bytes(game))
         self.assertEqual(restored, game)
-        self.assertEqual(len(restored["reviews"]), 2)
+        self.assertEqual(len(restored["reviews"]), 4)
         self.assertNotIn("species", restored["reviews"][0])
-        self.assertEqual(restored["reviews"][1]["species"], "axolotl")
-        self.assertEqual(pet_learned_count(restored), 30)
+        self.assertEqual([item for item in restored["reviews"] if item.get("species", "sniffer") == "sniffer"], first_results)
+        self.assertEqual(next(item for item in restored["reviews"] if item.get("species") == "axolotl")["milestone"], 50)
+        self.assertEqual(pet_learned_count(restored), 50)
 
     def test_bad_collection_cannot_skip_directly_to_the_last_creature(self):
         zoo = normalize_zoo({"active": "allay", "residents": [{"species": "allay", "name": "oops"}],
@@ -188,21 +188,21 @@ class ZooTests(unittest.TestCase):
             self.assertFalse(seen & ids)
             seen |= ids
 
-    def test_final_exam_blocks_six_out_of_ten_but_accepts_seven(self):
+    def test_final_exam_blocks_34_out_of_50_but_accepts_35_after_corrections(self):
         game = new_game()
         grow_current_pet(game, certify=False)
         self.assertTrue(growth_complete(game))
         self.assertFalse(ready_for_zoo(game))
         self.assertFalse(settle_pet(game))
         before = game["correct_answers"]
-        pass_exam(game, 6)
+        pass_exam(game, 34)
         self.assertFalse(final_passed(game))
         self.assertFalse(settle_pet(game))
         self.assertEqual(game["correct_answers"], before)
         self.assertEqual(pet_learned_count(game), 150)
-        pass_exam(game, 7)
+        pass_exam(game, 35)
         self.assertTrue(final_passed(game))
-        self.assertEqual([item["score"] for item in game["zoo"]["exam_history"]], [6, 7])
+        self.assertEqual([item["score"] for item in game["zoo"]["exam_history"]], [34, 35])
         self.assertTrue(settle_pet(game))
         self.assertEqual(current_species(game), "axolotl")
 

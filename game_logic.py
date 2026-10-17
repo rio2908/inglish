@@ -3,7 +3,7 @@
 import random
 from grammar import form_choices
 
-from learning_stats import normalize_progress, record_attempt
+from learning_stats import normalize_progress, pending_review, record_attempt
 from words import ALL_WORDS, WORD_BY_ID, words_for_species
 from zoo import current_species, new_zoo, normalize_zoo, pet_learned_count, record_pet_answer
 
@@ -67,6 +67,8 @@ def normalize_game(raw):
                 "seen": bool(record.get("seen", False)),
                 "correct_sessions": sessions,
             }
+            if type(record.get("last_error_session")) is int and record["last_error_session"] > 0:
+                game["cards"][word_id]["last_error_session"] = record["last_error_session"]
     game["garden_plants"] = min(game["garden_plants"], 10, mastered_count(game) // 15)
     lesson = raw.get("lesson")
     if isinstance(lesson, dict):
@@ -162,16 +164,22 @@ def growth_stage(game):
 
 def start_session(game, rng=None):
     rng = rng or random
+    if game["active_review"] is not None or pending_review(game) is not None:
+        return []
     game["session"] += 1
     pool = words_for_species(current_species(game))
     if game["zoo"]["replay"]:
         cards = game["zoo"]["pet_cards"]
         waiting = [word["id"] for word in pool if len(cards.get(word["id"], {}).get("correct_sessions", [])) < 2]
         rng.shuffle(waiting)
+        waiting.sort(key=lambda word: word not in game["repeat_words"])
         return waiting[:6] or rng.sample([word["id"] for word in pool], 6)
     seen_unmastered = [w["id"] for w in pool if game["cards"].get(w["id"], {}).get("seen") and not mastered(game, w["id"])]
     rng.shuffle(seen_unmastered)
-    review = seen_unmastered[:5]
+    mistakes = [word_id for word_id in game["repeat_words"]
+                if WORD_BY_ID[word_id]["species"] == current_species(game) and game["cards"].get(word_id, {}).get("seen")
+                and (not mastered(game, word_id) or game["cards"][word_id].get("last_error_session") == game["session"] - 1)]
+    review = list(dict.fromkeys(mistakes + seen_unmastered))[:5]
     new = [w["id"] for w in pool if not game["cards"].get(w["id"], {}).get("seen")][:5]
     if len(review) + len(new) < 6:
         known = [w["id"] for w in pool if mastered(game, w["id"])]
@@ -190,12 +198,16 @@ def record_answer(game, word_id, correct):
         raise ValueError("Сначала начни игровой раунд")
     if not isinstance(word_id, str) or word_id not in WORD_BY_ID:
         raise ValueError("Неизвестное слово")
+    if (WORD_BY_ID[word_id]["species"] == current_species(game)
+            and (game["active_review"] is not None or pending_review(game) is not None)):
+        raise ValueError("Сначала пройди контрольную и работу над ошибками")
     before_stage = growth_stage(game)
     record = record_for(game, word_id)
     record["seen"] = True
     record_attempt(game, word_id, correct)
     newly_pet_learned = record_pet_answer(game, word_id, correct)
     if not correct:
+        record["last_error_session"] = game["session"]
         return False
     was_mastered = mastered(game, word_id)
     game["correct_answers"] += 1
@@ -209,6 +221,22 @@ def record_answer(game, word_id, correct):
         game["growth_notice"] = {"species": current_species(game), "cycle": game["zoo"]["cycle"],
                                  "before": before_stage, "after": after_stage}
     return newly_pet_learned if game["zoo"]["replay"] else newly_mastered
+
+
+def lesson_retry(game, queue, index, word_id, rng=None):
+    """Retry an error after other cards; it still belongs to the same round."""
+    rng = rng or random
+    tail = [word for word in queue[index + 1:] if word != word_id]
+    fillers = [word["id"] for word in words_for_species(current_species(game))
+               if word["id"] != word_id and game["cards"].get(word["id"], {}).get("seen")]
+    while len(tail) < 2 and fillers:
+        tail.append(rng.choice(fillers))
+    if len(tail) < 2:
+        # A one-word legacy lesson has no other known material to insert.
+        # The saved error remains prioritized for the next real round instead.
+        return queue[:index + 1] + tail
+    tail.insert(min(2, len(tail)), word_id)
+    return queue[:index + 1] + tail
 
 
 def finish_session(game):

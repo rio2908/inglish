@@ -96,7 +96,7 @@ class FullLogicFlowTests(unittest.TestCase):
                     self.assertEqual(mastered_count(app.game), 150)
                     self.assertEqual(pet_learned_count(app.game), 0)
                     self.assertEqual(len(app.game["zoo"]["residents"]), 1)
-                    self.assertEqual(len(app.game["reviews"]), 5)
+                    self.assertEqual(len(app.game["reviews"]), 3)
                     app.request_replay(0)
                     self.assertEqual(app.screen, "replay_confirm")
                     app.start_replay()
@@ -107,8 +107,8 @@ class FullLogicFlowTests(unittest.TestCase):
                 self.assertEqual(mastered_count(app.game), 150)
                 self.assertEqual(len(app.game["zoo"]["residents"]), 1)
                 self.assertEqual(app.game["zoo"]["residents"][0]["grown"], 2)
-                self.assertEqual(len(app.game["reviews"]), 10)
-                self.assertEqual([item["score"] for item in app.game["zoo"]["exam_history"]], [10, 10])
+                self.assertEqual(len(app.game["reviews"]), 6)
+                self.assertEqual([item["score"] for item in app.game["zoo"]["exam_history"]], [50, 50])
                 self.assertEqual(store.load_game(identity), app.game)
                 with patch("game_logic.random", rng), patch("learning_stats.random", rng), patch("zoo.random", rng):
                     for count in range(2, 7):
@@ -116,7 +116,7 @@ class FullLogicFlowTests(unittest.TestCase):
                         self.assertEqual([item["species"] for item in app.game["zoo"]["residents"]],
                                          [key for key, _ in SPECIES[:count]])
                         self.assertEqual(mastered_count(app.game), count * 150)
-                        self.assertEqual(len(app.game["reviews"]), (count + 1) * 5)
+                        self.assertEqual(len(app.game["reviews"]), (count + 1) * 3)
                         self.assertEqual(store.load_game(identity), app.game)
                 self.assertEqual(len(app.game["zoo"]["exam_history"]), 7)
                 self.assertFalse(growth_complete(app.game))

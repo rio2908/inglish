@@ -22,13 +22,19 @@ from learning_stats import advance_review, answer_review, start_review
 from player_profiles import PlayerStore
 from words import WORDS, words_for_species
 from zoo import advance_final_test, answer_final_test, begin_replay, settle_pet, start_final_test
+from learning_fixtures import clear_checkpoints
+from assessments import expected_word
+from learning_stats import repair_review
+from zoo import repair_final_test
 
 
-def learn(game, count):
+def learn(game, count, checks=True):
     for _ in range(2):
         game["session"] += 1
         for word in words_for_species(game["zoo"]["active"])[:count]:
             record_answer(game, word["id"], True)
+            if checks:
+                clear_checkpoints(game)
     game["growth_notice"] = None
 
 
@@ -45,24 +51,37 @@ def scenario(kind):
         game["lesson"] = {"queue": ["cat", "dog"], "index": 0, "phase": phase,
                           "mode": "meaning", "correct": phase == "result", "answers": int(phase == "result")}
     elif kind.startswith("review-"):
-        learn(game, 30)
+        learn(game, 50, checks=False)
         review = start_review(game)
         if kind == "review-feedback":
             answer_review(game, review["queue"][0])
-        elif kind == "review-summary":
-            for expected in review["queue"][:]:
-                answer_review(game, expected)
+        elif kind == "review-summary" or "repair" in kind:
+            for i, expected in enumerate(review["queue"][:]):
+                wrong = next(word["id"] for word in WORDS if word["id"] != expected)
+                answer_review(game, wrong if "repair" in kind and i >= 14 else expected)
                 advance_review(game)
+            if "repair" in kind:
+                repair_review(game)
+                if not kind.endswith("intro"):
+                    advance_review(game)
+                if kind.endswith("feedback"):
+                    answer_review(game, expected_word(review))
     elif kind.startswith("final-"):
         learn(game, 150)
         exam = start_final_test(game)
         if kind == "final-feedback":
             answer_final_test(game, exam["queue"][0])
-        elif kind == "final-summary":
+        elif kind == "final-summary" or "repair" in kind:
             for i, expected in enumerate(exam["queue"][:]):
                 wrong = next(word["id"] for word in WORDS if word["id"] != expected)
-                answer_final_test(game, expected if i < 7 else wrong)
+                answer_final_test(game, expected if i < 35 else wrong)
                 advance_final_test(game)
+            if "repair" in kind:
+                repair_final_test(game)
+                if not kind.endswith("intro"):
+                    advance_final_test(game)
+                if kind.endswith("feedback"):
+                    answer_final_test(game, expected_word(exam))
     elif kind == "growth":
         learn(game, 29)
         game["session"] += 1
@@ -78,12 +97,6 @@ def scenario(kind):
             advance_final_test(game)
         assert settle_pet(game)
         learn(game, 60)
-        for _ in range(2):
-            review = start_review(game)
-            for expected in review["queue"][:]:
-                answer_review(game, expected)
-                advance_review(game)
-            game["active_review"] = None
         game["pet_name"] = "Розочка"
         assert begin_replay(game, 0)
         learn(game, 13)
@@ -125,6 +138,8 @@ class AndroidProfileRoundTripTests(unittest.TestCase):
             "review-feedback": "review", "review-summary": "review",
             "final-quiz": "final_test", "final-feedback": "final_test", "final-summary": "home",
             "growth": "growth", "replay": "cards",
+            "review-repair-intro": "review", "review-repair-quiz": "review", "review-repair-feedback": "review",
+            "final-repair-intro": "final_test", "final-repair-quiz": "final_test", "final-repair-feedback": "final_test",
         }
         for kind, expected_screen in expected_screens.items():
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:

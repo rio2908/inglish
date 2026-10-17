@@ -34,8 +34,8 @@ jobs:
 
       - name: Validate Python source
         run: |
-          python -m py_compile main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
-          python -m pyflakes main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
+          python -m py_compile main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py assessments.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
+          python -m pyflakes main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py assessments.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
           python -m unittest discover -s tests -v
 
       - name: Build Web Game with Pygbag

@@ -30,8 +30,8 @@ python -m pygbag --ume_block 0 .
 PowerShell:
 
 ```powershell
-python -m py_compile main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
-python -m pyflakes main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
+python -m py_compile main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py assessments.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
+python -m pyflakes main.py game_logic.py game_storage.py game_backup.py player_profiles.py learning_stats.py assessments.py vocabulary.py pet_behavior.py pet_games.py creature_sprites.py habitats.py curricula.py grammar.py instructions.py word_pictures.py sprites.py speech.py words.py zoo.py
 python -m unittest discover -s tests -v
 git diff --check
 ```
@@ -71,9 +71,11 @@ git diff --check
 
 ### Изменение баланса
 
-`test_logic_flow.py` проходит все шесть существ через настоящие обработчики `GameApp`: 900 слов, 30 коротких проверок, итоговые тесты и дополнительное повторное выращивание первого питомца с возвратом ожидающего второго. Хранилище в этом длительном сценарии — in-memory реализация `PlayerStore`; реальные файлы/миграции проверяются отдельными storage/UI-тестами. Отдельно проверяйте повторные клики в одном кадре, старые callbacks после выхода и восстановление номера раунда из старой копии.
+`test_logic_flow.py` проходит все шесть существ через настоящие обработчики `GameApp`: 900 слов, 18 контрольных, итоговые тесты 50–100 вопросов и дополнительное повторное выращивание первого питомца с возвратом ожидающего второго. Хранилище в этом длительном сценарии — in-memory реализация `PlayerStore`; реальные файлы/миграции проверяются отдельными storage/UI-тестами. Отдельно проверяйте повторные клики в одном кадре, старые callbacks после выхода и восстановление номера раунда из старой копии.
 
-Проверьте границы 29/30, 59/60, 89/90, 119/120, 149/150; два правильных ответа в одном и разных раундах; ровно 6/10 и 7/10 в итоговом тесте. Зафиксируйте, какой запрос пользователя разрешает изменение спецификации.
+Проверьте границы роста 29/30, 59/60, 89/90, 119/120, 149/150 и контрольных 49/50, 99/100, 149/150; два правильных ответа в одном и разных раундах. Контрольная: 13/20 против 14/20, 12/20 и 16/20 с работой над ошибками. Итоговые: на один ответ ниже и ровно 35/42/49/56/63/70, уникальность 50/60/70/80/90/100 ID, главы и отсутствие открытия до исправлений. Пользователь согласовал новые объёмы, три рубежа и обязательную работу над ошибками 2026-10-17.
+
+`test_assessments.py` проверяет модельный запрет продолжения, неизменность исходного балла, повторную ошибку с задержкой, отсутствие starvation из-за уже выученных ошибок и восстановление каждой фазы. `test_android_profiles.py` переносит также шесть новых фаз исправлений через настоящий JSON/дескрипторы с fake Android API. `test_profile_migration.py` читает настоящий старый документ двух игроков, сохраняет слова/коллекцию/уход/историю/ответы теста, экспортирует/импортирует файл и перезапускает хранилище. Отдельно проверьте выход, отмену и ошибку записи, браузерное завершение и Android Back.
 
 ### Изменение UI/графики
 
